@@ -1,0 +1,21 @@
+# Web / API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pydantic-settings>=2.3
+
+# Agent
+langgraph>=0.2.50
+langchain>=0.3
+langchain-openai>=0.2
+openai>=1.40
+
+# Vendor-neutral OpenTelemetry
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp-proto-http>=1.27
+opentelemetry-instrumentation-fastapi>=0.48b0
+
+# GenAI spans via OpenLLMetry (Traceloop). Emits the OTEL gen_ai.* semantic
+# conventions that Galileo's OTLP provider requires to classify spans, in one
+# coherent agent -> LLM -> tool trace. Vendor-neutral (works with any OTLP backend).
+opentelemetry-instrumentation-langchain

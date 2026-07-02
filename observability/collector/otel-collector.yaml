@@ -1,0 +1,54 @@
+# Vendor-neutral OpenTelemetry Collector config.
+#
+# The app exports OTLP here. This file is the ONLY place that knows about
+# observability backends. Swapping vendors = edit exporters + the traces pipeline
+# below; the application never changes.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  # ---- Galileo: ingests the OpenInference spans this app already emits. ------
+  # Every value below comes from .env (see the GALILEO_* block there). After
+  # editing .env, reload with:
+  #   docker compose up -d --force-recreate otel-collector   # NOT `restart`
+  otlp_http/galileo:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: ${env:GALILEO_LOG_STREAM}
+
+  # ---- Other vendors (uncomment + add to the pipeline to swap/fan out). -----
+
+  # Arize Phoenix (local OSS LLM tracing UI).
+  # otlphttp/phoenix:
+  #   endpoint: http://phoenix:6006
+
+  # Langfuse (OTLP endpoint).
+  # otlphttp/langfuse:
+  #   endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+  #   headers:
+  #     Authorization: ${env:LANGFUSE_AUTH}
+
+  # Splunk Observability Cloud.
+  # otlphttp/splunk:
+  #   endpoint: https://ingest.${env:SPLUNK_REALM}.signalfx.com/v2/trace/otlp
+  #   headers:
+  #     X-SF-Token: ${env:SPLUNK_ACCESS_TOKEN}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      # Galileo only. Add `debug` back here for local span logging.
+      exporters: [otlp_http/galileo]

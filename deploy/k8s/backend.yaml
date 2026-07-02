@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: agent-demo
+  labels: { app: backend }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: backend }
+  template:
+    metadata:
+      labels: { app: backend }
+    spec:
+      containers:
+        - name: backend
+          # Build & push this image, or load it into your local cluster:
+          #   docker build -t agent-chat-demo:latest ./backend
+          image: agent-chat-demo:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: LLM_PROVIDER
+              value: "local"
+            - name: OLLAMA_BASE_URL
+              value: "http://ollama:11434/v1"
+            - name: LOCAL_MODEL
+              value: "qwen2.5:0.5b"
+            - name: NIM_MODEL
+              value: "moonshotai/kimi-k2.6"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "agent-chat-demo"
+            - name: DEPLOYMENT_ENVIRONMENT
+              value: "k8s-demo"
+          envFrom:
+            - secretRef:
+                name: agent-demo-secrets
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: agent-demo
+spec:
+  selector: { app: backend }
+  ports:
+    - port: 80
+      targetPort: 8000

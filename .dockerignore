@@ -1,0 +1,15 @@
+# Keep the Docker build context small. Only backend/ and certs/ are needed by the build.
+.venv/
+.git/
+**/__pycache__/
+**/*.pyc
+.env
+.env.*
+deploy/
+observability/
+eval/
+docs/
+*.md
+docker-compose*.yaml
+.gitignore
+.dockerignore

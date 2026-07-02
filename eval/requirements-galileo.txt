@@ -1,0 +1,4 @@
+# Galileo admin tooling (NOT used by the vendor-neutral app at runtime).
+# Only needed to run eval/configure_galileo_metrics.py, which registers custom
+# RAG-quality judge metrics scored by your own model instead of gpt-4.1-mini.
+galileo

@@ -1,0 +1,38 @@
+# Local laptop demo: backend (serves UI) + Ollama (tiny model) + OTel Collector.
+# Cloud providers (OpenAI / NVIDIA NIM) are reached over the internet via .env.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      # Override .env hostnames for the compose network.
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ollama
+      - otel-collector
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    env_file: .env
+    volumes:
+      - ./observability/collector/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+volumes:
+  ollama:

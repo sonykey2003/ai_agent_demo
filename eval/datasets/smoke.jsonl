@@ -1,0 +1,3 @@
+{"input": "What is 21 * 2?", "expected_contains": ["42"]}
+{"input": "In one sentence, what is OpenTelemetry?", "expected_contains": ["observability"]}
+{"input": "Say the single word: hello", "expected_contains": ["hello"]}
