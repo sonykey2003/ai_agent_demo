@@ -86,11 +86,19 @@
       }
       .composer textarea::placeholder { color: var(--muted); }
       .composer-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 2px; }
+      .composer-bar .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
       .composer-bar .model { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
       .composer select {
         background: var(--panel); color: var(--text); border: 1px solid var(--border);
         border-radius: 999px; padding: 6px 10px; font-size: 12px; cursor: pointer; outline: none;
       }
+      .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+      .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+      .switch .track { width: 34px; height: 18px; border-radius: 999px; background: var(--border); transition: background 0.15s; position: relative; flex: none; }
+      .switch .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform 0.15s; }
+      .switch input:checked + .track { background: var(--guard); }
+      .switch input:checked + .track::after { transform: translateX(16px); }
+      .switch input:focus-visible + .track { box-shadow: 0 0 0 2px var(--accent); }
       .send {
         width: 36px; height: 36px; border-radius: 50%; border: 0; cursor: pointer;
         background: var(--accent); color: #fff; font-size: 17px; line-height: 1;
@@ -114,9 +122,19 @@
           <form class="composer" id="composer" autocomplete="off">
             <textarea id="input" rows="1" placeholder="Ask the agent…"></textarea>
             <div class="composer-bar">
-              <label class="model">Model
-                <select id="provider"></select>
-              </label>
+              <div class="controls">
+                <label class="model">Model
+                  <select id="provider"></select>
+                </label>
+                <label class="model">Domain
+                  <select id="domain"></select>
+                </label>
+                <label class="switch" title="Toggle the app's built-in input-block and output-PII-redaction guardrails. Turn off to demo an external guardrail (e.g. Galileo) on raw input/output.">
+                  <span>Built-in guardrails</span>
+                  <input type="checkbox" id="guardrails" checked />
+                  <span class="track"></span>
+                </label>
+              </div>
               <button class="send" id="send" type="submit" title="Send">↑</button>
             </div>
           </form>
@@ -131,6 +149,11 @@
       const input = document.getElementById("input");
       const sendBtn = document.getElementById("send");
       const providerSel = document.getElementById("provider");
+      const domainSel = document.getElementById("domain");
+      const guardrailsToggle = document.getElementById("guardrails");
+      const conversationId = crypto.randomUUID
+        ? crypto.randomUUID()
+        : `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
       function autoGrow() {
         input.style.height = "auto";
@@ -141,6 +164,21 @@
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
       });
 
+      // Remember the last Model/Domain/guardrails choice across reloads; when
+      // nothing is stored, fall back to a demo-friendly default, then the
+      // server default.
+      function selectValue(sel, storageKey, preferred, serverDefault) {
+        const saved = localStorage.getItem(storageKey);
+        const exists = (v) => v && [...sel.options].some((o) => o.value === v);
+        const val = [saved, preferred, serverDefault].find(exists);
+        if (val) sel.value = val;
+      }
+      providerSel.addEventListener("change", () => localStorage.setItem("ui.provider", providerSel.value));
+      domainSel.addEventListener("change", () => localStorage.setItem("ui.domain", domainSel.value));
+      const savedGuardrails = localStorage.getItem("ui.guardrails");
+      guardrailsToggle.checked = savedGuardrails === null ? false : savedGuardrails === "true";
+      guardrailsToggle.addEventListener("change", () => localStorage.setItem("ui.guardrails", guardrailsToggle.checked));
+
       async function loadProviders() {
         try {
           const res = await fetch("/providers");
@@ -149,11 +187,27 @@
             const opt = document.createElement("option");
             opt.value = p.id;
             opt.textContent = p.label;
-            if (p.id === data.default) opt.selected = true;
             providerSel.appendChild(opt);
           }
+          selectValue(providerSel, "ui.provider", "openai", data.default);
         } catch (e) {
           console.error("could not load providers", e);
+        }
+      }
+
+      async function loadDomains() {
+        try {
+          const res = await fetch("/domains");
+          const data = await res.json();
+          for (const d of data.domains) {
+            const opt = document.createElement("option");
+            opt.value = d.id;
+            opt.textContent = d.label;
+            domainSel.appendChild(opt);
+          }
+          selectValue(domainSel, "ui.domain", "bank", data.default);
+        } catch (e) {
+          console.error("could not load domains", e);
         }
       }
 
@@ -184,7 +238,13 @@
         const res = await fetch("/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, provider: providerSel.value }),
+          body: JSON.stringify({
+            message: text,
+            provider: providerSel.value,
+            domain: domainSel.value,
+            guardrails_enabled: guardrailsToggle.checked,
+            conversation_id: conversationId,
+          }),
         });
 
         const reader = res.body.getReader();
@@ -202,6 +262,7 @@
             let evt;
             try { evt = JSON.parse(raw.slice(5).trim()); } catch { continue; }
             if (evt.type === "token") { acc += evt.text; bubble.textContent = acc; }
+            else if (evt.type === "meta") addNotice("📚 grounding on domain: " + evt.domain + " · " + evt.collection);
             else if (evt.type === "tool") addNotice("🔧 tool · " + evt.name, "tool");
             else if (evt.type === "guardrail") addNotice("🛡️ blocked (" + evt.stage + "): " + evt.reason, "guard");
             else if (evt.type === "redacted") { bubble.textContent = evt.text; addNotice("🛡️ output redacted by guardrail", "guard"); }
@@ -225,6 +286,7 @@
       });
 
       loadProviders();
+      loadDomains();
       input.focus();
     </script>
   </body>

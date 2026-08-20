@@ -31,11 +31,11 @@ spec:
           lifecycle:
             postStart:
               exec:
-                # Pull the tiny model once the server is up (CPU-friendly).
+                # Pull the tiny chat and embedding models once the server is up.
                 command:
                   - /bin/sh
                   - -c
-                  - "until ollama list >/dev/null 2>&1; do sleep 1; done; ollama pull qwen2.5:0.5b"
+                  - "until ollama list >/dev/null 2>&1; do sleep 1; done; ollama pull qwen2.5:0.5b && ollama pull nomic-embed-text"
           volumeMounts:
             - name: models
               mountPath: /root/.ollama

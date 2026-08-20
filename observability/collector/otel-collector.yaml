@@ -16,11 +16,51 @@ processors:
   batch: {}
 
 exporters:
-  # ---- Galileo: ingests the OpenInference spans this app already emits. ------
-  # Every value below comes from .env (see the GALILEO_* block there). After
-  # editing .env, reload with:
+  # ---- Galileo: ingests the OTel GenAI spans this app already emits. ---------
+  # One exporter per domain: identical Galileo project/key, but a distinct
+  # `logstream` header so each domain's traces land in their own log stream.
+  # The `logstream` header is static per exporter, so per-domain routing needs
+  # per-domain exporters (see the `routing` connector below). Every value comes
+  # from .env (see the GALILEO_* block there). After editing .env, reload with:
   #   docker compose up -d --force-recreate otel-collector   # NOT `restart`
-  otlp_http/galileo:
+  otlp_http/galileo_bank:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: bank
+
+  otlp_http/galileo_healthcare:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: healthcare
+
+  otlp_http/galileo_insurance:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: insurance
+
+  otlp_http/galileo_restaurant:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: restaurant
+
+  otlp_http/galileo_platform:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: platform
+
+  # Fallback for traces with no domain.name (e.g. non-UI API clients): keeps the
+  # original GALILEO_LOG_STREAM behaviour.
+  otlp_http/galileo_default:
     traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
     headers:
       Galileo-API-Key: ${env:GALILEO_API_KEY}
@@ -45,10 +85,53 @@ exporters:
   #   headers:
   #     X-SF-Token: ${env:SPLUNK_ACCESS_TOKEN}
 
+connectors:
+  # Routes each span to a per-domain Galileo pipeline by the domain.name span
+  # attribute the app stamps on every span. Spans without domain.name fall to
+  # the default pipeline. Routing on span context keeps a whole trace together
+  # because every span in a turn carries the same domain.name.
+  routing:
+    error_mode: ignore
+    default_pipelines: [traces/galileo_default]
+    table:
+      - context: span
+        condition: attributes["domain.name"] == "bank"
+        pipelines: [traces/galileo_bank]
+      - context: span
+        condition: attributes["domain.name"] == "healthcare"
+        pipelines: [traces/galileo_healthcare]
+      - context: span
+        condition: attributes["domain.name"] == "insurance"
+        pipelines: [traces/galileo_insurance]
+      - context: span
+        condition: attributes["domain.name"] == "restaurant"
+        pipelines: [traces/galileo_restaurant]
+      - context: span
+        condition: attributes["domain.name"] == "platform"
+        pipelines: [traces/galileo_platform]
+
 service:
   pipelines:
-    traces:
+    # Receive from the app, then fan out by domain via the routing connector.
+    traces/in:
       receivers: [otlp]
       processors: [batch]
-      # Galileo only. Add `debug` back here for local span logging.
-      exporters: [otlp_http/galileo]
+      exporters: [routing]
+    traces/galileo_bank:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_bank]
+    traces/galileo_healthcare:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_healthcare]
+    traces/galileo_insurance:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_insurance]
+    traces/galileo_restaurant:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_restaurant]
+    traces/galileo_platform:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_platform]
+    traces/galileo_default:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_default]

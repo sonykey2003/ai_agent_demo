@@ -1,0 +1,33 @@
+# Reused from the golden demo's "insurance" domain (data/eval-facing).
+# Knowledge lives in docs/qa.csv; datasets here are for Galileo eval and
+# context-adherence / coherence baselining.
+
+domain:
+  name: "insurance"
+  description: "Insurance assistant for online help and customer account support"
+
+galileo:
+  project: "shawn-otel-demo"
+  log_stream: "insurance"
+
+model:
+  default_provider: "local"
+  temperature: 0.1
+
+rag:
+  enabled: true
+  knowledge_dir: "domains/insurance/docs"
+  chunk_size: 1000
+  chunk_overlap: 200
+  top_k: 3
+
+vectorstore:
+  embedding_model: "nomic-embed-text"
+  collection: "ai_agent_demo_insurance"
+
+dataset:
+  qa: "domains/insurance/docs/qa.csv"
+  csv: "domains/insurance/dataset.csv"
+  jsonl: "domains/insurance/dataset.jsonl"
+  input_column: "input"
+  output_column: "output"

@@ -15,7 +15,7 @@ spec:
       containers:
         - name: backend
           # Build & push this image, or load it into your local cluster:
-          #   docker build -t agent-chat-demo:latest ./backend
+          #   docker build -t agent-chat-demo:latest -f backend/Dockerfile .
           image: agent-chat-demo:latest
           imagePullPolicy: IfNotPresent
           ports:
@@ -27,6 +27,21 @@ spec:
               value: "http://ollama:11434/v1"
             - name: LOCAL_MODEL
               value: "qwen2.5:0.5b"
+            - name: OLLAMA_GEMMA_MODEL
+              value: "gemma4:latest"
+            - name: OLLAMA_EMBEDDING_BASE_URL
+              value: "http://ollama:11434"
+            - name: OLLAMA_EMBEDDING_MODEL
+              value: "nomic-embed-text"
+            - name: RAG_ENABLED
+              value: "true"
+            - name: RAG_COLLECTION
+              value: "ai_agent_demo_knowledge"
+            - name: POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-demo-secrets
+                  key: POSTGRES_URL
             - name: NIM_MODEL
               value: "moonshotai/kimi-k2.6"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -35,17 +50,23 @@ spec:
               value: "agent-chat-demo"
             - name: DEPLOYMENT_ENVIRONMENT
               value: "k8s-demo"
+            - name: OTEL_REDACT_PII
+              value: "true"
+            - name: LLM_STREAM_USAGE
+              value: "true"
           envFrom:
             - secretRef:
                 name: agent-demo-secrets
           readinessProbe:
             httpGet: { path: /healthz, port: 8000 }
-            initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet: { path: /healthz, port: 8000 }
-            initialDelaySeconds: 10
             periodSeconds: 20
+          startupProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 5
+            failureThreshold: 120
           resources:
             requests: { cpu: "100m", memory: "256Mi" }
             limits: { cpu: "1", memory: "1Gi" }

@@ -8,7 +8,11 @@ pydantic-settings>=2.3
 langgraph>=0.2.50
 langchain>=0.3
 langchain-openai>=0.2
+langchain-ollama>=0.2
+langchain-postgres>=0.0.12
+langchain-text-splitters>=0.3
 openai>=1.40
+psycopg[binary]>=3.2
 
 # Vendor-neutral OpenTelemetry
 opentelemetry-sdk>=1.27
@@ -19,3 +23,8 @@ opentelemetry-instrumentation-fastapi>=0.48b0
 # conventions that Galileo's OTLP provider requires to classify spans, in one
 # coherent agent -> LLM -> tool trace. Vendor-neutral (works with any OTLP backend).
 opentelemetry-instrumentation-langchain
+
+# Optional Galileo Agent Control (only used when AGENT_CONTROL_ENABLED=true).
+galileo>=2.3.0
+agent-control-sdk[galileo]>=7.10.0
+agent-control-evaluator-galileo>=7.10.0

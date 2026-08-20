@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
+from ..privacy import redact_pii
+
 
 @dataclass
 class GuardrailResult:
@@ -27,9 +29,6 @@ class Guardrail(Protocol):
 class DefaultGuardrail:
     """PII redaction on output + naive jailbreak/prompt-injection block on input."""
 
-    _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-    _PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3}\)?[\s-]?)\d{3}[\s-]?\d{4}\b")
-    _SSN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
     _JAILBREAK = re.compile(
         r"ignore\s+(?:all\s+|any\s+|the\s+)*(?:previous|prior|earlier|preceding|above)?"
         r"\s*instructions|jailbreak|DAN mode|do anything now",
@@ -44,10 +43,7 @@ class DefaultGuardrail:
         return GuardrailResult(allowed=True)
 
     def check_output(self, text: str) -> GuardrailResult:
-        redacted = self._SSN.sub("[REDACTED-SSN]", text)
-        redacted = self._EMAIL.sub("[REDACTED-EMAIL]", redacted)
-        redacted = self._PHONE.sub("[REDACTED-PHONE]", redacted)
-        return GuardrailResult(allowed=True, redacted_text=redacted)
+        return GuardrailResult(allowed=True, redacted_text=redact_pii(text))
 
 
 def get_guardrail() -> Guardrail:

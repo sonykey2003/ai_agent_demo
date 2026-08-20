@@ -2,3 +2,7 @@
 # Only needed to run eval/configure_galileo_metrics.py, which registers custom
 # RAG-quality judge metrics scored by your own model instead of gpt-4.1-mini.
 galileo
+
+# Agent Control (eval/agent_control_demo.py) additionally needs the Agent Control
+# SDK, which ships with your Galileo deployment and is NOT on public PyPI:
+#     pip install agent-control agent-control-telemetry

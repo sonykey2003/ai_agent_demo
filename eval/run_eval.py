@@ -15,10 +15,13 @@ import json
 import sys
 from pathlib import Path
 
+from opentelemetry import trace
+
 # Make the backend package importable when run from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.agent.graph import build_agent  # noqa: E402
+from app.telemetry.otel import setup_telemetry, shutdown_telemetry  # noqa: E402
 
 
 def load_cases(path: Path) -> list[dict]:
@@ -26,21 +29,43 @@ def load_cases(path: Path) -> list[dict]:
 
 
 def run(dataset: Path, provider: str | None) -> bool:
-    agent = build_agent(provider=provider)
-    cases = load_cases(dataset)
-    passed = 0
-    for i, case in enumerate(cases, 1):
-        result = agent.invoke({"messages": [("user", case["input"])]})
-        answer = result["messages"][-1].content or ""
-        expected = case.get("expected_contains", [])
-        ok = all(s.lower() in answer.lower() for s in expected)
-        passed += int(ok)
-        print(f"[{i}] {'PASS' if ok else 'FAIL'} :: {case['input'][:60]}")
-        if not ok:
-            print(f"      expected to contain: {expected}")
-            print(f"      got: {answer[:160]}")
-    print(f"\n{passed}/{len(cases)} passed")
-    return passed == len(cases)
+    setup_telemetry()
+    try:
+        agent = build_agent(provider=provider)
+        cases = load_cases(dataset)
+        passed = 0
+        tracer = trace.get_tracer("agent_chat.evaluation")
+        for i, case in enumerate(cases, 1):
+            conversation_id = f"eval-{dataset.stem}-{i}"
+            with tracer.start_as_current_span("evaluate agent case") as span:
+                span.set_attribute("evaluation.dataset.name", dataset.name)
+                span.set_attribute("evaluation.case.index", i)
+                span.set_attribute("evaluation.case.id", conversation_id)
+                span.set_attribute("input.value", case["input"])
+
+                result = agent.invoke(
+                    {"messages": [("user", case["input"])]},
+                    config={
+                        "configurable": {"thread_id": conversation_id},
+                        "run_name": "Evaluation Agent",
+                    },
+                )
+                answer = result["messages"][-1].content or ""
+                expected = case.get("expected_contains", [])
+                ok = all(s.lower() in answer.lower() for s in expected)
+                span.set_attribute("evaluation.expected_contains", expected)
+                span.set_attribute("evaluation.passed", ok)
+                span.set_attribute("output.value", answer)
+
+                passed += int(ok)
+                print(f"[{i}] {'PASS' if ok else 'FAIL'} :: {case['input'][:60]}")
+                if not ok:
+                    print(f"      expected to contain: {expected}")
+                    print(f"      got: {answer[:160]}")
+        print(f"\n{passed}/{len(cases)} passed")
+        return passed == len(cases)
+    finally:
+        shutdown_telemetry()
 
 
 def main() -> int:

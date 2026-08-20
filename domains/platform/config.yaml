@@ -1,0 +1,43 @@
+# Domain package for the demo's own subject matter: the observability platform.
+#
+# This mirrors the golden demo's domains/ layout (config + system_prompt + docs +
+# dataset) but stays data/eval-facing: the running app still reads its knowledge
+# from backend/knowledge and its settings from .env. Use this package to build
+# and upload Galileo datasets for evaluation and context-adherence / coherence
+# baselining.
+
+domain:
+  name: "platform"
+  description: >-
+    Assistant grounded in the demo knowledge base: OpenTelemetry, Galileo, RAG
+    evaluation, model providers, and the app architecture.
+
+# Where the eval traces land. The running app/Collector read these from .env;
+# these values are recorded here so dataset uploads target the same project.
+galileo:
+  project: "shawn-otel-demo"
+  log_stream: "apjc_galileo_demo"
+
+model:
+  default_provider: "local"
+  temperature: 0.2
+
+# RAG grounding source (shared with the running app; not duplicated here).
+rag:
+  enabled: true
+  knowledge_dir: "backend/knowledge"
+  chunk_size: 1000
+  chunk_overlap: 200
+  top_k: 3
+
+vectorstore:
+  embedding_model: "nomic-embed-text"
+  collection: "ai_agent_demo_knowledge"
+
+# Ground-truth Q&A and the generated Galileo upload artifacts.
+dataset:
+  qa: "domains/platform/docs/qa.csv"
+  csv: "domains/platform/dataset.csv"
+  jsonl: "domains/platform/dataset.jsonl"
+  input_column: "input"
+  output_column: "output"

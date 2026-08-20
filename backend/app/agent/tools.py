@@ -3,15 +3,38 @@
 from __future__ import annotations
 
 import ast
+import contextvars
 import json
+import logging
 import operator
-import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from langchain_core.tools import tool
 from opentelemetry import trace
-from opentelemetry.trace import SpanKind
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
+from ..config import get_settings
+from ..rag.vector_store import get_vector_store
 
 _tracer = trace.get_tracer("galileo_demo.retriever")
+log = logging.getLogger(__name__)
+
+# Carries the pgvector collection for the current request so retrieval (which
+# runs inside the agent's pre-model hook) grounds on the UI-selected domain.
+active_rag_collection: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "active_rag_collection", default=None
+)
+
+
+@contextmanager
+def rag_collection_scope(collection: str | None) -> Iterator[None]:
+    """Scope the active retrieval collection to one request."""
+    token = active_rag_collection.set(collection)
+    try:
+        yield
+    finally:
+        active_rag_collection.reset(token)
 
 _OPERATORS = {
     ast.Add: operator.add,
@@ -43,129 +66,35 @@ def calculator(expression: str) -> str:
         return f"error: {exc}"
 
 
-# A tiny built-in knowledge base. Each entry is a retrievable "chunk". The agent
-# grounds its answers in these passages, which lets RAG-quality evaluators
-# (context adherence, completeness, chunk attribution/utilization) score the run.
-_KNOWLEDGE_BASE = [
-    {
-        "id": "kb-otel",
-        "title": "OpenTelemetry",
-        "source": "docs/observability.md",
-        "content": (
-            "OpenTelemetry (OTel) is a vendor-neutral, open-source framework for "
-            "generating, collecting, and exporting telemetry data: traces, metrics, "
-            "and logs. Applications emit spans over OTLP to a collector, which routes "
-            "them to any observability backend."
-        ),
-    },
-    {
-        "id": "kb-galileo",
-        "title": "Galileo",
-        "source": "docs/galileo.md",
-        "content": (
-            "Galileo is a GenAI observability and evaluation platform. It ingests "
-            "traces, including over OpenTelemetry/OTLP, and runs automated quality "
-            "metrics such as context adherence, completeness, and chunk attribution "
-            "on LLM and agent responses."
-        ),
-    },
-    {
-        "id": "kb-nim",
-        "title": "NVIDIA NIM",
-        "source": "docs/providers.md",
-        "content": (
-            "NVIDIA NIM provides OpenAI-compatible inference microservices for "
-            "optimized model serving. In this demo it serves the Kimi K2 model through "
-            "an OpenAI-compatible API endpoint."
-        ),
-    },
-    {
-        "id": "kb-ollama",
-        "title": "Ollama",
-        "source": "docs/providers.md",
-        "content": (
-            "Ollama runs small open-weight models locally and exposes an "
-            "OpenAI-compatible API on port 11434. The demo uses it to run a tiny model "
-            "with no external network calls."
-        ),
-    },
-    {
-        "id": "kb-arch",
-        "title": "Demo architecture",
-        "source": "docs/architecture.md",
-        "content": (
-            "This demo is a vendor-agnostic AI agent chat app. A FastAPI backend runs a "
-            "LangGraph ReAct agent that calls an OpenAI-compatible model. The agent is "
-            "instrumented with OpenTelemetry, and spans flow over OTLP to a collector "
-            "and on to Galileo and other backends."
-        ),
-    },
-    {
-        "id": "kb-eval",
-        "title": "RAG evaluation metrics",
-        "source": "docs/evaluation.md",
-        "content": (
-            "Context adherence measures whether a response is grounded in retrieved "
-            "context. Chunk attribution and chunk utilization measure which retrieved "
-            "chunks influenced the answer. Completeness measures how fully the answer "
-            "covers the question. These are RAG metrics and require a retrieval step."
-        ),
-    },
-    {
-        "id": "kb-vendor-neutral",
-        "title": "Vendor-neutral observability",
-        "source": "docs/observability.md",
-        "content": (
-            "Because the app emits standard OpenTelemetry gen_ai spans, switching "
-            "observability backends is a collector configuration change, not a code "
-            "change. The same trace can fan out to Galileo, Splunk, Phoenix, or Jaeger "
-            "at once."
-        ),
-    },
-]
+def _retrieve(query: str, k: int, collection: str | None) -> list[tuple[dict, float]]:
+    """Return pgvector similarity hits in the app's stable document shape."""
+    settings = get_settings()
+    matches = get_vector_store(collection).similarity_search_with_relevance_scores(
+        query,
+        k=k,
+        score_threshold=settings.rag_score_threshold,
+    )
+    return [
+        (
+            {
+                "id": document.metadata.get("citation_id")
+                or document.metadata.get("chunk_id")
+                or document.id
+                or "unknown",
+                "title": document.metadata.get("title")
+                or document.metadata.get("source", "Knowledge document"),
+                "source": document.metadata.get("source", "unknown"),
+                "content": document.page_content,
+            },
+            float(score),
+        )
+        for document, score in matches
+    ]
 
 
-def _tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", text.lower()))
-
-
-# Common words carry no retrieval signal; matching on them pulls in random
-# passages for unrelated prompts (e.g. a cold-email request). Drop them so only
-# meaningful query terms count.
-_STOPWORDS = {
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "to",
-    "of", "in", "on", "for", "and", "or", "but", "with", "as", "at", "by", "from",
-    "this", "that", "these", "those", "it", "its", "i", "you", "he", "she", "we",
-    "they", "me", "my", "your", "our", "their", "what", "which", "who", "whom",
-    "whose", "when", "where", "why", "how", "do", "does", "did", "can", "could",
-    "should", "would", "will", "shall", "may", "might", "must", "have", "has", "had",
-    "about", "into", "than", "then", "so", "if", "not", "no", "yes", "please",
-    "tell", "write", "give", "explain", "describe", "call", "called", "new", "one",
-    "short", "sentence", "relate", "related", "work", "works", "use", "used", "using",
-}
-
-# Minimum fraction of meaningful query terms that must appear in a passage for it
-# to count as relevant. Keeps unrelated prompts from triggering retrieval at all.
-_MIN_SCORE = 0.25
-
-
-def _retrieve(query: str, k: int = 3) -> list[tuple[dict, float]]:
-    """Score the knowledge base against the query by meaningful term overlap."""
-    q = _tokenize(query) - _STOPWORDS
-    if not q:
-        return []
-    scored: list[tuple[dict, float]] = []
-    for doc in _KNOWLEDGE_BASE:
-        terms = _tokenize(f"{doc['title']} {doc['content']}")
-        overlap = len(q & terms)
-        score = overlap / len(q)
-        if score >= _MIN_SCORE:
-            scored.append((doc, score))
-    scored.sort(key=lambda item: item[1], reverse=True)
-    return scored[:k]
-
-
-def retrieve_context(query: str, k: int = 3) -> tuple[str, list[tuple[dict, float]]]:
+def retrieve_context(
+    query: str, k: int | None = None, collection: str | None = None
+) -> tuple[str, list[tuple[dict, float]]]:
     """Retrieve relevant knowledge-base passages for a query.
 
     Runs as a deterministic pre-step (classic retrieve-then-generate), so the
@@ -174,19 +103,44 @@ def retrieve_context(query: str, k: int = 3) -> tuple[str, list[tuple[dict, floa
     tools. Emits an OpenTelemetry retriever span using open conventions (OTel db.* +
     OpenInference retrieval.documents.*) that any RAG-scoring backend can read.
     Returns ("", []) when nothing matches, so non-knowledge turns stay non-RAG.
+
+    The collection is passed explicitly by the caller (bound to the selected domain
+    at agent-build time); it falls back to the request-scoped contextvar. If no
+    collection is bound, retrieval is skipped - it never silently queries the
+    default/platform collection.
     """
-    hits = _retrieve(query, k)
-    if not hits:
+    settings = get_settings()
+    if not settings.rag_enabled:
         return "", []
 
+    collection = collection or active_rag_collection.get()
+    if collection is None:
+        log.warning(
+            "No RAG collection bound for this request; skipping retrieval "
+            "instead of querying the default collection"
+        )
+        return "", []
     with _tracer.start_as_current_span(
         "retrieve knowledge_base", kind=SpanKind.CLIENT
     ) as span:
         span.set_attribute("openinference.span.kind", "RETRIEVER")
-        span.set_attribute("db.system", "in_memory")
+        span.set_attribute("db.system", "postgresql")
         span.set_attribute("db.operation", "query")
+        span.set_attribute("db.namespace", collection)
         span.set_attribute("input.value", query)
+        try:
+            hits = _retrieve(query, k or settings.rag_top_k, collection)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("RAG retrieval unavailable: %s", exc)
+            span.record_exception(exc)
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_status(Status(StatusCode.ERROR, str(exc)))
+            return "", []
+
         span.set_attribute("retrieval.documents.count", len(hits))
+        span.set_attribute("retrieval.top_k", k or settings.rag_top_k)
+        span.set_attribute("retrieval.score_threshold", settings.rag_score_threshold)
+        span.set_attribute("embedding.model", settings.ollama_embedding_model)
         for i, (doc, score) in enumerate(hits):
             prefix = f"retrieval.documents.{i}.document."
             span.set_attribute(prefix + "id", doc["id"])
@@ -196,11 +150,95 @@ def retrieve_context(query: str, k: int = 3) -> tuple[str, list[tuple[dict, floa
                 prefix + "metadata",
                 json.dumps({"title": doc["title"], "source": doc["source"]}),
             )
+        # Galileo reads retriever output as a document list and requires each to
+        # carry page_content; this populates the chunk display + RAG scoring.
+        span.set_attribute(
+            "output.value",
+            json.dumps(
+                [
+                    {
+                        "page_content": d["content"],
+                        "metadata": {
+                            "id": d["id"],
+                            "title": d["title"],
+                            "source": d["source"],
+                            "score": round(float(s), 4),
+                        },
+                    }
+                    for d, s in hits
+                ]
+            ),
+        )
 
-    context = "\n\n".join(
-        f"[{doc['id']}] {doc['title']}: {doc['content']}" for doc, _ in hits
-    )
-    return context, hits
+    if not hits:
+        return "", []
+
+    # Rerank step: currently a passthrough that preserves similarity order. Emits
+    # an OpenInference RERANKER span so the pipeline reads retrieve -> rerank ->
+    # augment; swap the body for a cross-encoder to make it real.
+    with _tracer.start_as_current_span(
+        "rerank documents", kind=SpanKind.INTERNAL
+    ) as rr:
+        rr.set_attribute("openinference.span.kind", "RERANKER")
+        rr.set_attribute("reranker.model_name", "relevance-threshold")
+        rr.set_attribute("reranker.query", query)
+        rr.set_attribute("input.value", query)
+        for i, (doc, score) in enumerate(hits):
+            p = f"reranker.input_documents.{i}.document."
+            rr.set_attribute(p + "id", doc["id"])
+            rr.set_attribute(p + "content", doc["content"])
+            rr.set_attribute(p + "score", round(float(score), 4))
+        # Precision cut: keep only strongly-relevant candidates so off-topic
+        # chunks don't pollute the prompt context. Fall back to the single best
+        # hit so a knowledge turn is never left with no context.
+        reranked = [
+            (d, s) for d, s in hits if s >= settings.rag_rerank_min_score
+        ] or hits[:1]
+        rr.set_attribute("reranker.top_k", len(reranked))
+        for i, (doc, score) in enumerate(reranked):
+            p = f"reranker.output_documents.{i}.document."
+            rr.set_attribute(p + "id", doc["id"])
+            rr.set_attribute(p + "content", doc["content"])
+            rr.set_attribute(p + "score", round(float(score), 4))
+        rr.set_attribute(
+            "output.value",
+            json.dumps(
+                [
+                    {
+                        "page_content": d["content"],
+                        "metadata": {"id": d["id"], "score": round(float(s), 4)},
+                    }
+                    for d, s in reranked
+                ]
+            ),
+        )
+
+    # Discrete augmentation step (documents -> prompt context), emitted as a tool
+    # span so it appears as its own step for RAG observability (parity with the
+    # golden demo's "prompt-augmentation" tool span).
+    with _tracer.start_as_current_span(
+        "prompt-augmentation", kind=SpanKind.INTERNAL
+    ) as aug:
+        aug.set_attribute("gen_ai.operation.name", "execute_tool")
+        aug.set_attribute("gen_ai.tool.name", "prompt-augmentation")
+        context = "\n\n".join(
+            f"[{doc['id']}] {doc['title']}: {doc['content']}" for doc, _ in reranked
+        )
+        arguments = json.dumps(
+            {
+                "task": "format retrieved documents into prompt context",
+                "document_ids": [doc["id"] for doc, _ in reranked],
+            }
+        )
+        # Galileo reads a tool span's I/O from gen_ai.tool.call.arguments/result;
+        # input.value/output.value are kept as fallbacks.
+        aug.set_attribute("gen_ai.tool.call.arguments", arguments)
+        aug.set_attribute("input.value", arguments)
+        aug.set_attribute("gen_ai.tool.call.result", context)
+        aug.set_attribute("output.value", context)
+        aug.set_attribute("num_docs", len(reranked))
+        aug.set_attribute("context.chars", len(context))
+    return context, reranked
 
 
 TOOLS = [calculator]
