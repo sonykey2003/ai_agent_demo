@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from urllib.parse import urlparse
 
 from ..config import get_settings
@@ -41,6 +42,7 @@ except Exception:  # noqa: BLE001
 _ENABLED = bool(get_settings().agent_control_enabled) and _ac is not None
 _initialized = False
 _logger = None  # native GalileoLogger that owns Agent Control turn traces
+_otel_sink = False  # True when control spans are emitted over OTLP (otel sink)
 
 
 def control(*args, **kwargs):
@@ -62,6 +64,30 @@ def is_active() -> bool:
 def get_ac_logger():
     """Native Galileo logger that owns Agent Control turn traces (or None)."""
     return _logger if is_active() else None
+
+
+def otel_sink_active() -> bool:
+    """True when control spans are emitted over OTLP nested in the app trace."""
+    return is_active() and _otel_sink
+
+
+def bind_otel_trace_context(span) -> None:
+    """Nest Agent Control's OTLP control spans under the given OTel span."""
+    if not otel_sink_active():
+        return
+    ctx = span.get_span_context()
+    # Galileo normalizes collector-ingested OTel trace_ids to a UUIDv4 (forcing
+    # the version/variant bits). The control span goes direct-OTLP, so hand it the
+    # same normalized id or the two land in separate traces.
+    tid = uuid.UUID(int=ctx.trace_id, version=4).hex
+    sid = format(ctx.span_id, "016x")
+    _ac.set_trace_context_provider(lambda: {"trace_id": tid, "span_id": sid})
+
+
+def unbind_otel_trace_context() -> None:
+    """Clear the Agent Control trace-context provider after a turn."""
+    if otel_sink_active():
+        _ac.clear_trace_context_provider()
 
 
 def setup_agent_control() -> bool:
@@ -126,7 +152,8 @@ def setup_agent_control() -> bool:
         # The bridge attaches the rich @control span (Controls tab, evaluator
         # breakdown) to an active logger trace; OTel-domain turns have no active
         # logger trace, so their control step is the app's OTel guardrail span.
-        native = bool(settings.native_domains())
+        otel_sink = settings.agent_control_otel_sink
+        native = bool(settings.native_domains()) and not otel_sink
         if native:
             logger.enable_agent_control()
             logger.start_session(name=settings.agent_control_agent_name)
@@ -137,15 +164,30 @@ def setup_agent_control() -> bool:
             server_url=settings.agent_control_url,
             api_key=settings.galileo_api_key,
             api_key_header=settings.agent_control_api_key_header,
-            observability_enabled=native,
+            observability_enabled=native or otel_sink,
             target_type=settings.agent_control_target_type,
             target_id=logger.log_stream_id,
         )
-        if native:
+        if otel_sink:
+            # Control spans over OTLP (typed "control" spans), nested into the
+            # app's OTel trace via set_trace_context_provider (see main.py).
+            init_kwargs["observability_sink_name"] = "otel"
+            init_kwargs["observability_sink_config"] = {
+                "enabled": True,
+                "endpoint": settings.galileo_otel_endpoint,
+                "headers": {
+                    settings.agent_control_api_key_header: settings.galileo_api_key,
+                    "projectid": logger.project_id,
+                    "logstreamid": logger.log_stream_id,
+                },
+                "service_name": settings.otel_service_name,
+            }
+        elif native:
             init_kwargs["observability_sink_name"] = "registered"
         _ac.init(**init_kwargs)
-        global _logger
+        global _logger, _otel_sink
         _logger = logger
+        _otel_sink = otel_sink
         _initialized = True
         try:
             n = len(_ac.get_server_controls())

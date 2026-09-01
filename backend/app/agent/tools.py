@@ -16,6 +16,8 @@ from opentelemetry.trace import SpanKind, Status, StatusCode
 
 from ..config import get_settings
 from ..rag.vector_store import get_vector_store
+from .agent_control import ControlSteerError, ControlViolationError, control
+from .bank_db import query_customers
 
 _tracer = trace.get_tracer("galileo_demo.retriever")
 log = logging.getLogger(__name__)
@@ -64,6 +66,41 @@ def calculator(expression: str) -> str:
         return str(_safe_eval(ast.parse(expression, mode="eval").body))
     except Exception as exc:  # noqa: BLE001
         return f"error: {exc}"
+
+
+# Bank-only DB tool. The query runs as an Agent Control step ("query_customer_db")
+# so a control can govern it (e.g. block destructive SQL) exactly like the
+# getting-started-labs guardrails demo; it's a no-op passthrough when no control
+# is bound to that step. The .name/.tool_name marks it as a TOOL step so Agent
+# Control exposes the args as a dict (input.sql), not a flattened string.
+query_customers.name = "query_customer_db"
+query_customers.tool_name = "query_customer_db"
+_query_customers_controlled = control(step_name="query_customer_db")(query_customers)
+
+
+@tool
+def query_customer_db(sql: str) -> str:
+    """Look up bank customer records with a read-only SQL SELECT.
+
+    Table: customers(id TEXT, name TEXT, email TEXT, account_type TEXT, balance REAL).
+    account_type is one of 'Savings', 'Checking', 'Premier'.
+    Example: SELECT name, balance FROM customers WHERE account_type = 'Savings' ORDER BY balance DESC.
+    Returns JSON: {"success", "row_count", "data": [...]}.
+    """
+    # Keyword so Agent Control resolves the value at its "input.sql" path.
+    try:
+        return _query_customers_controlled(sql=sql)
+    except ControlSteerError as exc:
+        # Steer: return the guidance so the model revises the SQL and retries.
+        guidance = str(getattr(exc, "steering_context", "") or exc)
+        return json.dumps(
+            {"success": False, "revise_query": guidance, "data": []}
+        )
+    except ControlViolationError as exc:
+        # Deny: report the block so the model tells the user (no retry).
+        return json.dumps(
+            {"success": False, "blocked_by_policy": str(exc), "data": []}
+        )
 
 
 def _retrieve(query: str, k: int, collection: str | None) -> list[tuple[dict, float]]:
@@ -242,3 +279,9 @@ def retrieve_context(
 
 
 TOOLS = [calculator]
+_BANK_TOOLS = [calculator, query_customer_db]
+
+
+def tools_for_domain(domain: str | None) -> list:
+    """Bank gets the customer-DB tool; every other domain stays calculator-only."""
+    return _BANK_TOOLS if domain == "bank" else TOOLS

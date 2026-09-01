@@ -28,10 +28,13 @@ from .agent.guardrails import get_guardrail
 from .agent.agent_control import (
     ControlSteerError,
     ControlViolationError,
+    bind_otel_trace_context,
     evaluate_user_input,
     get_ac_logger,
     is_active as agent_control_active,
+    otel_sink_active,
     setup_agent_control,
+    unbind_otel_trace_context,
 )
 from .agent.tools import rag_collection_scope
 from .config import get_settings
@@ -199,6 +202,8 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
             log.exception("Agent Control input check failed; allowing the turn.")
 
         collected: list[str] = []
+        tool_calls: list[tuple[str, object, object]] = []
+        pending_tools: dict = {}
         with rag_collection_scope(domain.collection):
             agent = build_agent(
                 provider=req.provider, temperature=req.temperature, domain=domain.name
@@ -220,15 +225,30 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
                             collected.append(token)
                             yield _sse({"type": "token", "text": token})
                     elif kind == "on_tool_start":
-                        yield _sse(
-                            {
-                                "type": "tool",
-                                "name": event.get("name", "tool"),
-                                "input": event.get("data", {}).get("input"),
-                            }
-                        )
+                        name = event.get("name", "tool")
+                        tin = event.get("data", {}).get("input")
+                        pending_tools[event.get("run_id")] = (name, tin)
+                        yield _sse({"type": "tool", "name": name, "input": tin})
+                    elif kind == "on_tool_end":
+                        name, tin = pending_tools.pop(event.get("run_id"), (None, None))
+                        if name:
+                            tool_calls.append(
+                                (name, tin, event.get("data", {}).get("output"))
+                            )
             finally:
                 otel_context.detach(suppress)
+
+        # Log tool calls (e.g. the bank customer DB query) as tool spans so the
+        # DB step shows in the native trace alongside the control spans.
+        for tname, tin, tout in tool_calls:
+            try:
+                logger.add_tool_span(
+                    input=json.dumps(tin, default=str),
+                    output=str(getattr(tout, "content", tout)),
+                    name=tname,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         answer = "".join(collected)
         displayed_answer = answer
@@ -283,7 +303,12 @@ async def _event_stream(req: ChatRequest):
     # Per-domain tracing: native Galileo SDK for the configured domains (deepest
     # Agent Control integration -- rich control span + Controls tab); every other
     # domain stays on the OTLP -> Collector -> Galileo path (OTel adoption story).
-    if agent_control_active() and domain.name in settings.native_domains():
+    # When the OTel control sink is active, all domains stay on the OTel path.
+    if (
+        agent_control_active()
+        and not otel_sink_active()
+        and domain.name in settings.native_domains()
+    ):
         async for chunk in _agent_control_stream(req, cfg, domain):
             yield chunk
         return
@@ -317,6 +342,9 @@ async def _event_stream(req: ChatRequest):
                 # input also gives Galileo the turn input when the streamed LLM
                 # child spans come back empty.
                 set_turn_input(ac_span, req.message)
+                # Nest Agent Control's OTLP control spans under this turn (no-op
+                # unless the otel control sink is active).
+                bind_otel_trace_context(turn_span)
                 try:
                     await evaluate_user_input(req.message)
                     set_guardrail_result(ac_span, allowed=True)
@@ -342,6 +370,8 @@ async def _event_stream(req: ChatRequest):
                         ac_span, allowed=True, reason="control check errored; allowed"
                     )
                     log.exception("Agent Control input check failed; allowing the turn.")
+                finally:
+                    unbind_otel_trace_context()
 
         if req.guardrails_enabled:
             with start_guardrail_span("input") as guardrail_span:

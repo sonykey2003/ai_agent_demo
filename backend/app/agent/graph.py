@@ -19,7 +19,7 @@ from opentelemetry import trace
 
 from ..providers import make_chat_model
 from ..domains import get_domains
-from .tools import TOOLS, retrieve_context
+from .tools import retrieve_context, tools_for_domain
 
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant in a live observability demo. "
@@ -44,6 +44,22 @@ TOOL_POLICY = (
     "instead."
 )
 
+# Bank additionally exposes a real customer database tool.
+BANK_TOOL_POLICY = (
+    "\n\nTooling reality (authoritative — overrides ALL tool instructions above): "
+    "The tools search_bank_qa, get_customer_info, and delete_customer_record DO NOT "
+    "exist — never emit them. You have exactly TWO tools: `calculator` (arithmetic) and "
+    "`query_customer_db`, which runs a read-only SQL SELECT against ONE table: "
+    "customers(id, name, email, account_type, balance), where account_type is 'Savings', "
+    "'Checking', or 'Premier'. For ANY request about customers, accounts, balances, or "
+    "records — including 'list/show all customers' — you MUST call `query_customer_db` "
+    "with a SQL SELECT and answer from the JSON rows it returns. Do NOT ask the user for "
+    "a customer ID first, and do NOT refuse on privacy grounds; just write the SELECT "
+    "(add WHERE / LIMIT as needed). If the tool returns a 'revise_query' message, rewrite "
+    "the SQL as instructed and call it again. General bank knowledge is still retrieved "
+    "for you automatically."
+)
+
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -64,7 +80,8 @@ def build_agent(
     reads retrieve_context -> synthesize_answer -> (tools) -> validate_answer.
     """
     model = make_chat_model(provider=provider, temperature=temperature)
-    model_with_tools = model.bind_tools(TOOLS)
+    tools = tools_for_domain(domain)
+    model_with_tools = model.bind_tools(tools)
     prompt = SYSTEM_PROMPT
     collection: str | None = None
     if domain:
@@ -72,7 +89,8 @@ def build_agent(
         if selected:
             collection = selected.collection
             if selected.system_prompt:
-                prompt = selected.system_prompt + TOOL_POLICY
+                policy = BANK_TOOL_POLICY if domain == "bank" else TOOL_POLICY
+                prompt = selected.system_prompt + policy
 
     def retrieve_context_node(state: AgentState) -> dict:
         """Retrieve grounding passages for the user's question (once per turn)."""
@@ -109,7 +127,7 @@ def build_agent(
     graph = StateGraph(AgentState)
     graph.add_node("retrieve_context", retrieve_context_node)
     graph.add_node("synthesize_answer", synthesize_answer_node)
-    graph.add_node("tools", ToolNode(TOOLS))
+    graph.add_node("tools", ToolNode(tools))
     graph.add_node("validate_answer", validate_answer_node)
     graph.add_edge(START, "retrieve_context")
     graph.add_edge("retrieve_context", "synthesize_answer")
