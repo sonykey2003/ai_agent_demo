@@ -1,0 +1,167 @@
+# Fan-out Collector config: exports every trace to BOTH Galileo AND Langfuse.
+#
+# Selected via OTEL_COLLECTOR_CONFIG=otel-collector.fanout.yaml in .env (see
+# docker-compose.yaml). Combines otel-collector.yaml (Galileo) and
+# otel-collector.langfuse.yaml (Langfuse): each domain's pipeline exports to its
+# Galileo log stream and its Langfuse project simultaneously, for a true
+# side-by-side comparison on identical traffic. The app is unchanged; PII
+# redaction still happens app-side, so both backends receive the same spans.
+#
+# Requires both credential blocks in .env: GALILEO_* and LANGFUSE_*.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  # ---- Galileo: one exporter per domain (distinct logstream header). ---------
+  otlp_http/galileo_bank:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: bank
+
+  otlp_http/galileo_healthcare:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: healthcare
+
+  otlp_http/galileo_insurance:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: insurance
+
+  otlp_http/galileo_restaurant:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: restaurant
+
+  otlp_http/galileo_platform:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: platform
+
+  otlp_http/galileo_default:
+    traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
+    headers:
+      Galileo-API-Key: ${env:GALILEO_API_KEY}
+      project: ${env:GALILEO_PROJECT}
+      logstream: ${env:GALILEO_LOG_STREAM}
+
+  # ---- Langfuse: one exporter per domain (distinct project Basic auth). -------
+  otlp_http/langfuse_bank:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_BANK}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      # A corp TLS-inspecting proxy (e.g. Cisco Secure Access) re-signs
+      # cloud.langfuse.com with a CA the container doesn't trust, so verify is
+      # skipped for the Langfuse leg only. Galileo (galileocloud.io) stays verified.
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_healthcare:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_HEALTHCARE}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_insurance:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_INSURANCE}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_restaurant:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_RESTAURANT}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_platform:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_PLATFORM}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_default:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_DEFAULT}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+connectors:
+  # Routes each span by domain.name to a combined pipeline that fans out to both
+  # backends. Spans without domain.name fall to the default pipeline.
+  routing:
+    error_mode: ignore
+    default_pipelines: [traces/fanout_default]
+    table:
+      - context: span
+        condition: attributes["domain.name"] == "bank"
+        pipelines: [traces/fanout_bank]
+      - context: span
+        condition: attributes["domain.name"] == "healthcare"
+        pipelines: [traces/fanout_healthcare]
+      - context: span
+        condition: attributes["domain.name"] == "insurance"
+        pipelines: [traces/fanout_insurance]
+      - context: span
+        condition: attributes["domain.name"] == "restaurant"
+        pipelines: [traces/fanout_restaurant]
+      - context: span
+        condition: attributes["domain.name"] == "platform"
+        pipelines: [traces/fanout_platform]
+
+service:
+  pipelines:
+    # Receive from the app, then fan out by domain via the routing connector.
+    traces/in:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [routing]
+    # Each domain pipeline exports to Galileo AND Langfuse at once.
+    traces/fanout_bank:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_bank, otlp_http/langfuse_bank]
+    traces/fanout_healthcare:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_healthcare, otlp_http/langfuse_healthcare]
+    traces/fanout_insurance:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_insurance, otlp_http/langfuse_insurance]
+    traces/fanout_restaurant:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_restaurant, otlp_http/langfuse_restaurant]
+    traces/fanout_platform:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_platform, otlp_http/langfuse_platform]
+    traces/fanout_default:
+      receivers: [routing]
+      exporters: [otlp_http/galileo_default, otlp_http/langfuse_default]

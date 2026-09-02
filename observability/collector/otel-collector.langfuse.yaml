@@ -1,0 +1,137 @@
+# Langfuse backend variant of the Collector config (comparison workstream).
+#
+# Selected via the OTEL_COLLECTOR_CONFIG toggle in .env (see docker-compose.yaml).
+# The app is unchanged: it emits the same OpenInference (input.value/output.value)
+# + gen_ai.* + OpenLLMetry spans and speaks OTLP to this Collector. Only the
+# Collector's destination differs. Mirrors otel-collector.yaml but fans out to a
+# per-domain Langfuse PROJECT (one Authorization header per project) instead of a
+# per-domain Galileo log stream.
+#
+# Langfuse ingests OTLP over HTTP at <endpoint>/v1/traces. The otlphttp exporter
+# appends /v1/traces to `endpoint`, so LANGFUSE_OTLP_ENDPOINT is the base
+# /api/public/otel URL. Auth is HTTP Basic: base64("<public_key>:<secret_key>")
+# of the target project, supplied as `Basic <base64>` in LANGFUSE_AUTH_<DOMAIN>.
+# The x-langfuse-ingestion-version header enables real-time v4 ingestion.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  # ---- Langfuse: one exporter per domain, each to its own project. ----------
+  # Same endpoint + version header everywhere; only the Basic auth (project key
+  # pair) differs, so per-domain routing needs per-domain exporters (see the
+  # `routing` connector below). Every value comes from .env (see the LANGFUSE_*
+  # block there). After editing .env, reload with:
+  #   docker compose up -d --force-recreate otel-collector   # NOT `restart`
+  otlp_http/langfuse_bank:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_BANK}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      # A corp TLS-inspecting proxy (e.g. Cisco Secure Access) re-signs
+      # cloud.langfuse.com with a CA the container doesn't trust, so verify is
+      # skipped here. Remove this block if your egress is not TLS-intercepted.
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_healthcare:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_HEALTHCARE}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_insurance:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_INSURANCE}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_restaurant:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_RESTAURANT}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  otlp_http/langfuse_platform:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_PLATFORM}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+  # Fallback for traces with no domain.name (e.g. non-UI API clients): reuses the
+  # platform project key by default (override with LANGFUSE_AUTH_DEFAULT in .env).
+  otlp_http/langfuse_default:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_AUTH_DEFAULT}
+      x-langfuse-ingestion-version: "4"
+    tls:
+      insecure_skip_verify: true
+
+connectors:
+  # Routes each span to a per-domain Langfuse pipeline by the domain.name span
+  # attribute the app stamps on every span. Spans without domain.name fall to the
+  # default pipeline. Routing on span context keeps a whole trace together because
+  # every span in a turn carries the same domain.name. (Identical to the Galileo
+  # variant, so both backends group traces the same way.)
+  routing:
+    error_mode: ignore
+    default_pipelines: [traces/langfuse_default]
+    table:
+      - context: span
+        condition: attributes["domain.name"] == "bank"
+        pipelines: [traces/langfuse_bank]
+      - context: span
+        condition: attributes["domain.name"] == "healthcare"
+        pipelines: [traces/langfuse_healthcare]
+      - context: span
+        condition: attributes["domain.name"] == "insurance"
+        pipelines: [traces/langfuse_insurance]
+      - context: span
+        condition: attributes["domain.name"] == "restaurant"
+        pipelines: [traces/langfuse_restaurant]
+      - context: span
+        condition: attributes["domain.name"] == "platform"
+        pipelines: [traces/langfuse_platform]
+
+service:
+  pipelines:
+    # Receive from the app, then fan out by domain via the routing connector.
+    traces/in:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [routing]
+    traces/langfuse_bank:
+      receivers: [routing]
+      exporters: [otlp_http/langfuse_bank]
+    traces/langfuse_healthcare:
+      receivers: [routing]
+      exporters: [otlp_http/langfuse_healthcare]
+    traces/langfuse_insurance:
+      receivers: [routing]
+      exporters: [otlp_http/langfuse_insurance]
+    traces/langfuse_restaurant:
+      receivers: [routing]
+      exporters: [otlp_http/langfuse_restaurant]
+    traces/langfuse_platform:
+      receivers: [routing]
+      exporters: [otlp_http/langfuse_platform]
+    traces/langfuse_default:
+      receivers: [routing]
+      exporters: [otlp_http/langfuse_default]

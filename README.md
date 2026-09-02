@@ -193,6 +193,62 @@ as an offline `eval/` admin helper (see
 [Pre-prod experiments](#pre-prod-experiments-llm--guardrails), below) — the
 vendor-neutral app never imports the Galileo SDK for tracing.
 
+## Compare backends: Langfuse Cloud
+
+Because the app only speaks OTLP to the Collector, adding a second backend is a
+Collector + `.env` change with **no application code change**.
+[Langfuse](https://langfuse.com) Cloud is wired as a second destination for a
+side-by-side comparison with Galileo.
+
+One `.env` switch picks the Collector config (see the Langfuse block in
+`.env.example`):
+
+```bash
+# OTEL_COLLECTOR_CONFIG options:
+#   otel-collector.yaml          -> Galileo only (default)
+#   otel-collector.langfuse.yaml -> Langfuse only
+#   otel-collector.fanout.yaml   -> BOTH at once (side-by-side)
+OTEL_COLLECTOR_CONFIG=otel-collector.fanout.yaml
+```
+
+Then:
+
+1. Create a project in [Langfuse Cloud](https://cloud.langfuse.com) (US or EU)
+   and copy its public/secret API keys.
+2. Set the region endpoint and the Basic-auth header(s) in `.env`, base64-encoding
+   the key pair. All domains can share one project, or use per-domain projects to
+   mirror the Galileo per-domain log streams:
+
+   ```bash
+   LANGFUSE_OTLP_ENDPOINT=https://us.cloud.langfuse.com/api/public/otel   # EU: cloud.langfuse.com
+   echo -n "pk-lf-...:sk-lf-..." | base64   # paste after "Basic " into LANGFUSE_AUTH_<DOMAIN>
+   ```
+3. Reload the Collector so it picks up the new values (`restart` will not):
+
+   ```bash
+   docker compose up -d --force-recreate otel-collector
+   ```
+
+Chat in each domain at `http://localhost:8800`; the same OpenInference / `gen_ai.*`
+spans land in the Langfuse project. Langfuse maps `input.value` / `output.value`
+to observation input/output, `gen_ai.request.model` to the generation model, and
+the per-turn `session.id` groups turns into a Langfuse session — all from the
+app's existing spans. PII redaction still runs in the app before the first OTLP
+hop, so Langfuse receives the same masked content as Galileo.
+
+The app tags traces with `deployment.environment=demo`, which Langfuse maps to an
+environment. In the Langfuse UI, select the **demo** environment (the UI defaults
+to `default`) or the trace list looks empty. Langfuse v4 stores traces in its new
+event model, so use the Observations view / Observations API v2 — the legacy
+`/api/public/traces` endpoint is retired.
+
+With `otel-collector.fanout.yaml` every trace goes to Galileo **and** Langfuse at
+once (verified: one chat lands in the Galileo `platform` log stream and the
+Langfuse project simultaneously) — ideal for a side-by-side comparison. The
+single-backend configs keep them mutually exclusive. Switch back to Galileo-only
+by setting `OTEL_COLLECTOR_CONFIG=otel-collector.yaml` and recreating the
+Collector.
+
 ## Agent Control (optional runtime guardrail)
 
 The app can optionally run [Galileo Agent Control](https://docs.galileo.ai/how-to-guides/agent-control/initialize-and-configure-agent-control)

@@ -69,7 +69,11 @@ services:
     command: ["--config=/etc/otelcol/config.yaml"]
     env_file: .env
     volumes:
-      - ./observability/collector/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+      # Which backend the Collector routes to is a config swap, never app code.
+      # Default = Galileo. Options for OTEL_COLLECTOR_CONFIG (in .env):
+      #   otel-collector.yaml (Galileo) | otel-collector.langfuse.yaml (Langfuse
+      #   Cloud) | otel-collector.fanout.yaml (both).
+      - ./observability/collector/${OTEL_COLLECTOR_CONFIG:-otel-collector.yaml}:/etc/otelcol/config.yaml:ro
     ports:
       - "4317:4317"
       - "4318:4318"
