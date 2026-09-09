@@ -111,5 +111,9 @@ def test_stream_passes_thread_id_and_redacts_output(monkeypatch) -> None:
     )
 
     assert captured["config"]["configurable"]["thread_id"] == "conversation-2"
-    assert {"type": "redacted", "text": "[REDACTED-EMAIL]"} in events
+    assert {
+        "type": "redacted",
+        "text": "[REDACTED-EMAIL]",
+        "source": "built-in",
+    } in events
     assert events[-1] == {"type": "done"}

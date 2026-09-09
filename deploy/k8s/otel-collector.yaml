@@ -23,7 +23,7 @@ data:
           Galileo-API-Key: ${env:GALILEO_API_KEY}
           project: ${env:GALILEO_PROJECT}
           logstream: ${env:GALILEO_LOG_STREAM}
-    service:
+    service:  
       pipelines:
         traces:
           receivers: [otlp]

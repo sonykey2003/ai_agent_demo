@@ -29,6 +29,9 @@ from .agent.agent_control import (
     ControlSteerError,
     ControlViolationError,
     bind_otel_trace_context,
+    control_block_message,
+    describe_control_error,
+    evaluate_assistant_output,
     evaluate_user_input,
     get_ac_logger,
     is_active as agent_control_active,
@@ -39,6 +42,7 @@ from .agent.agent_control import (
 from .agent.tools import rag_collection_scope
 from .config import get_settings
 from .domains import DEFAULT_DOMAIN, get_domains
+from .providers import make_chat_model
 from .rag.ingest import ingest_all
 from .telemetry.otel import (
     active_domain_scope,
@@ -146,6 +150,79 @@ def _chunk_text(chunk) -> str:
     return str(content or "")
 
 
+_STEER_REVISION_PROMPT = (
+    "You are revising an assistant reply so it complies with a policy control.\n"
+    "Policy guidance: {guidance}\n"
+    "Rewrite the reply to satisfy that guidance while keeping every compliant "
+    "detail and the original tone. Mask or drop only the offending content. "
+    "Reply with the revised text alone -- no preamble, no explanation."
+)
+
+
+async def _revise_for_steer(
+    answer: str, guidance: str, req: ChatRequest, *, suppress_otel: bool
+) -> str | None:
+    """Rewrite `answer` per a steer control's steering context, then re-check it.
+
+    Returns None when the control gave no guidance or the rewrite still trips a
+    control, so the caller falls back to withholding the answer.
+    """
+    if not guidance:
+        return None
+    model = make_chat_model(provider=req.provider, temperature=req.temperature)
+    token = (
+        otel_context.attach(
+            otel_context.set_value(_SUPPRESS_INSTRUMENTATION_KEY, True)
+        )
+        if suppress_otel
+        else None
+    )
+    try:
+        result = await model.ainvoke(
+            [
+                ("system", _STEER_REVISION_PROMPT.format(guidance=guidance)),
+                ("user", answer),
+            ]
+        )
+    finally:
+        if token is not None:
+            otel_context.detach(token)
+    revised = _chunk_text(result).strip()
+    if not revised:
+        return None
+    try:
+        await evaluate_assistant_output(revised)
+    except (ControlSteerError, ControlViolationError):
+        return None
+    return revised
+
+
+async def _resolve_output_control(
+    answer: str, req: ChatRequest, *, suppress_otel: bool = False
+) -> tuple[str, dict | None]:
+    """Apply the output-side control: steer revises the answer, deny withholds it.
+
+    Returns (text to display, control info) with info None when nothing fired.
+    Non-control failures propagate so the caller can fail open.
+    """
+    try:
+        await evaluate_assistant_output(answer)
+        return answer, None
+    except ControlSteerError as exc:
+        info = describe_control_error(exc)
+        revised = await _revise_for_steer(
+            answer, info["detail"], req, suppress_otel=suppress_otel
+        )
+        info["revised"] = revised is not None
+        if revised is not None:
+            return revised, info
+        return control_block_message(info), info
+    except ControlViolationError as exc:
+        info = describe_control_error(exc)
+        info["revised"] = False
+        return control_block_message(info), info
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
@@ -192,10 +269,19 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
         try:
             await evaluate_user_input(req.message)
         except (ControlViolationError, ControlSteerError) as exc:
-            reason = f"Agent Control: {exc}"
+            info = describe_control_error(exc)
+            reason = info["reason"]
             logger.conclude(output=reason)
             concluded = True
-            yield _sse({"type": "guardrail", "stage": "input", "reason": reason})
+            yield _sse(
+                {
+                    "type": "guardrail",
+                    "stage": "input",
+                    "reason": reason,
+                    "control": info["control"],
+                    "action": info["action"],
+                }
+            )
             yield _sse({"type": "done"})
             return
         except Exception:  # noqa: BLE001
@@ -258,7 +344,47 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
                 gout.redacted_text if gout.redacted_text is not None else answer
             )
             if displayed_answer != answer:
-                yield _sse({"type": "redacted", "text": displayed_answer})
+                yield _sse(
+                    {
+                        "type": "redacted",
+                        "text": displayed_answer,
+                        "source": "built-in",
+                    }
+                )
+
+        # Output-side Agent Control. Galileo owns the outcome end to end (no built-in
+        # regex redaction): a steer rewrites the answer with the control's steering
+        # context, a deny withholds it.
+        if agent_control_active():
+            control_info: dict | None = None
+            try:
+                displayed_answer, control_info = await _resolve_output_control(
+                    answer, req, suppress_otel=True
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("Agent Control output check failed; showing answer as-is.")
+            if control_info:
+                yield _sse(
+                    {
+                        "type": "redacted",
+                        "text": displayed_answer,
+                        "source": "galileo-agent-control",
+                        "control": control_info["control"],
+                        "action": control_info["action"],
+                        "revised": control_info["revised"],
+                    }
+                )
+                yield _sse(
+                    {
+                        "type": "guardrail",
+                        "stage": "output",
+                        "reason": control_info["reason"],
+                        "source": "galileo-agent-control",
+                        "control": control_info["control"],
+                        "action": control_info["action"],
+                        "revised": control_info["revised"],
+                    }
+                )
 
         logger.add_llm_span(
             input=req.message,
@@ -349,20 +475,35 @@ async def _event_stream(req: ChatRequest):
                     await evaluate_user_input(req.message)
                     set_guardrail_result(ac_span, allowed=True)
                     ac_span.set_attribute(
-                        "output.value", json.dumps({"action": "allow", "matched": False})
+                        "output.value",
+                        json.dumps({"action": "allow", "matched": False}),
                     )
                 except (ControlViolationError, ControlSteerError) as exc:
-                    reason = f"Agent Control: {exc}"
+                    info = describe_control_error(exc)
+                    reason = info["reason"]
                     set_guardrail_result(ac_span, allowed=False, reason=reason)
-                    action = "steer" if isinstance(exc, ControlSteerError) else "deny"
                     ac_span.set_attribute(
                         "output.value",
-                        json.dumps({"action": action, "matched": True, "reason": reason}),
+                        json.dumps(
+                            {
+                                "action": info["action"],
+                                "matched": True,
+                                "reason": reason,
+                            }
+                        ),
                     )
                     set_turn_output(turn_span, reason)
                     turn_span.set_attribute("agent.result", "blocked_by_agent_control")
                     turn_span.set_status(Status(StatusCode.OK))
-                    yield _sse({"type": "guardrail", "stage": "input", "reason": reason})
+                    yield _sse(
+                        {
+                            "type": "guardrail",
+                            "stage": "input",
+                            "reason": reason,
+                            "control": info["control"],
+                            "action": info["action"],
+                        }
+                    )
                     yield _sse({"type": "done"})
                     return
                 except Exception:  # noqa: BLE001
@@ -382,7 +523,9 @@ async def _event_stream(req: ChatRequest):
             if not gin.allowed:
                 turn_span.set_attribute("agent.result", "blocked")
                 set_turn_output(turn_span, gin.reason)
-                yield _sse({"type": "guardrail", "stage": "input", "reason": gin.reason})
+                yield _sse(
+                    {"type": "guardrail", "stage": "input", "reason": gin.reason}
+                )
                 yield _sse({"type": "done"})
                 return
 
@@ -432,6 +575,8 @@ async def _event_stream(req: ChatRequest):
         answer = "".join(collected)
         displayed_answer = answer
         redacted = False
+        redacted_source = None
+        redacted_control: dict | None = None
         if req.guardrails_enabled:
             with start_guardrail_span("output") as guardrail_span:
                 gout = _guardrail.check_output(answer)
@@ -439,19 +584,69 @@ async def _event_stream(req: ChatRequest):
                     gout.redacted_text if gout.redacted_text is not None else answer
                 )
                 redacted = displayed_answer != answer
+                if redacted:
+                    redacted_source = "built-in"
                 set_guardrail_result(
                     guardrail_span,
                     allowed=gout.allowed,
                     reason=gout.reason,
                     redacted=redacted,
                 )
+        # Output-side Agent Control, independent of the built-in toggle. Galileo owns
+        # the outcome: a steer rewrites the answer with the control's steering context,
+        # a deny withholds it (no built-in regex redaction either way).
+        if agent_control_active():
+            with start_guardrail_span("output") as ac_out:
+                ac_out.set_attribute("guardrail.provider", "galileo-agent-control")
+                bind_otel_trace_context(turn_span)
+                control_info: dict | None = None
+                try:
+                    displayed_answer, control_info = await _resolve_output_control(
+                        answer, req
+                    )
+                    if control_info is None:
+                        set_guardrail_result(ac_out, allowed=True)
+                    else:
+                        set_guardrail_result(
+                            ac_out,
+                            allowed=False,
+                            reason=control_info["reason"],
+                            redacted=True,
+                        )
+                except Exception:  # noqa: BLE001
+                    set_guardrail_result(
+                        ac_out, allowed=True, reason="control check errored; allowed"
+                    )
+                    log.exception("Agent Control output check failed; allowing the turn.")
+                finally:
+                    unbind_otel_trace_context()
+                if control_info:
+                    redacted = True
+                    redacted_source = "galileo-agent-control"
+                    redacted_control = {
+                        "control": control_info["control"],
+                        "action": control_info["action"],
+                        "revised": control_info["revised"],
+                    }
+                    yield _sse(
+                        {
+                            "type": "guardrail",
+                            "stage": "output",
+                            "reason": control_info["reason"],
+                            "source": "galileo-agent-control",
+                            **redacted_control,
+                        }
+                    )
         turn_span.set_attribute("agent.result", "completed")
         # Re-assert input: the streaming instrumentor overwrites gen_ai.input.messages
         # with an empty capture during the run, so restore it after the loop.
         set_turn_input(turn_span, req.message)
         set_turn_output(turn_span, displayed_answer)
         if redacted:
-            yield _sse({"type": "redacted", "text": displayed_answer})
+            payload = {"type": "redacted", "text": displayed_answer, "source": redacted_source or "built-in"}
+            if redacted_control:
+                payload.update(redacted_control)
+            yield _sse(payload)
 
         yield _sse({"type": "done"})
 

@@ -264,8 +264,8 @@
             if (evt.type === "token") { acc += evt.text; bubble.textContent = acc; }
             else if (evt.type === "meta") addNotice("📚 grounding on domain: " + evt.domain + " · " + evt.collection);
             else if (evt.type === "tool") addNotice("🔧 tool · " + evt.name, "tool");
-            else if (evt.type === "guardrail") addNotice("🛡️ blocked (" + evt.stage + "): " + evt.reason, "guard");
-            else if (evt.type === "redacted") { bubble.textContent = evt.text; addNotice("🛡️ output redacted by guardrail", "guard"); }
+            else if (evt.type === "guardrail") { const by = evt.source === "galileo-agent-control" ? " · Galileo Agent Control" : evt.source === "built-in" ? " · built-in guardrail" : ""; addNotice("🛡️ blocked (" + evt.stage + ")" + by + ": " + evt.reason, "guard"); }
+            else if (evt.type === "redacted") { bubble.textContent = evt.text; const verb = evt.action === "steer" ? (evt.revised ? "revised (steer)" : "withheld (steer, no revision)") : evt.action === "deny" ? "withheld (deny)" : evt.action; const lbl = evt.source === "galileo-agent-control" ? evt.control ? "🛡️ output " + verb + " by Galileo Agent Control · " + evt.control : "🛡️ output withheld by Galileo Agent Control" : "🛡️ output redacted by built-in guardrail"; addNotice(lbl, "guard"); }
             else if (evt.type === "error") addNotice("⚠️ " + evt.message, "error");
             messagesEl.scrollTop = messagesEl.scrollHeight;
           }

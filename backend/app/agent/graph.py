@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -21,6 +22,10 @@ from ..providers import make_chat_model
 from ..domains import get_domains
 from .tools import retrieve_context, tools_for_domain
 
+# Shared across every compiled graph so a conversation's history follows its
+# thread_id even if the user switches provider or domain mid-chat.
+_CHECKPOINTER = InMemorySaver()
+
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant in a live observability demo. "
     "Be concise and accurate. When the user's turn includes retrieved context "
@@ -28,6 +33,10 @@ SYSTEM_PROMPT = (
     "passages do not cover the question, say so and answer from general knowledge. "
     "Use the calculator tool for arithmetic."
 )
+
+_FOLLOW_UP_MAX_CHARS = 40
+_FOLLOW_UP_MAX_WORDS = 4
+_CONTEXT_TURNS = 3
 
 # The reused domain prompts (golden demo) instruct the model to call tools like
 # search_bank_qa / get_customer_info that this app does NOT register — only
@@ -44,26 +53,77 @@ TOOL_POLICY = (
     "instead."
 )
 
+FOLLOW_UP_POLICY = (
+    "\n\nResolve short follow-ups, pronouns, and one-word replies against earlier "
+    "turns in the conversation rather than treating them as a new topic."
+)
+
 # Bank additionally exposes a real customer database tool.
 BANK_TOOL_POLICY = (
     "\n\nTooling reality (authoritative — overrides ALL tool instructions above): "
     "The tools search_bank_qa, get_customer_info, and delete_customer_record DO NOT "
     "exist — never emit them. You have exactly TWO tools: `calculator` (arithmetic) and "
-    "`query_customer_db`, which runs a read-only SQL SELECT against ONE table: "
+    "`query_customer_db`, which runs a SQL statement against TWO tables: "
     "customers(id, name, email, account_type, balance), where account_type is 'Savings', "
-    "'Checking', or 'Premier'. For ANY request about customers, accounts, balances, or "
-    "records — including 'list/show all customers' — you MUST call `query_customer_db` "
-    "with a SQL SELECT and answer from the JSON rows it returns. Do NOT ask the user for "
-    "a customer ID first, and do NOT refuse on privacy grounds; just write the SELECT "
-    "(add WHERE / LIMIT as needed). If the tool returns a 'revise_query' message, rewrite "
-    "the SQL as instructed and call it again. General bank knowledge is still retrieved "
-    "for you automatically."
+    "'Checking', or 'Premier'; and transactions(id, account_id, txn_date, merchant, "
+    "category, amount), the account activity ledger where account_id joins customers.id. "
+    "Use `transactions` for any spending, ledger, activity, statement, merchant, or "
+    "category question, and do NOT join to `customers` unless the user asks for the "
+    "customer's name or contact details. A separate query-layer policy governs which SQL "
+    "is allowed — "
+    "you do NOT enforce it. For ANY request about customers, accounts, balances, records, "
+    "or transactions — including 'list/show all customers' or 'show the whole ledger' — "
+    "you MUST call `query_customer_db` and answer "
+    "from the JSON rows it returns. Read requests: write a SELECT that returns exactly what "
+    "the user asked for, and do NOT add a LIMIT or any row cap of your own — row limits are "
+    "the query-layer policy's decision, not yours. "
+    "If the user asks to modify or remove data (e.g. 'delete all customers', "
+    "'update a balance'), write the matching SQL (DELETE / UPDATE) and call "
+    "`query_customer_db` — do NOT refuse and do NOT lecture about safety; the query-layer "
+    "policy decides whether it runs. Do NOT ask the user for a customer ID first, and do "
+    "NOT refuse on privacy grounds. If the tool returns a 'revise_query' message, rewrite "
+    "the SQL exactly as instructed and call `query_customer_db` again in the SAME turn, then "
+    "answer from the rows it returns — do NOT stop to explain the block, do NOT ask permission, "
+    "and do NOT offer to fetch the data in batches; if it returns 'blocked_by_policy', tell the "
+    "user the query was blocked by policy. General bank knowledge is still retrieved for "
+    "you automatically."
 )
+
+
+def build_retrieval_query(messages: list) -> str:
+    """Expand a short follow-up into a retrievable query using earlier user turns.
+
+    "okay" or "account lookups." carry no retrievable signal on their own and score
+    under the RAG threshold, so the turn loses its grounding; prefixing the preceding
+    user turns restores the topic.
+    """
+    human_messages = [
+        message for message in messages if isinstance(message, HumanMessage)
+    ]
+    if not human_messages:
+        return ""
+    latest_content = human_messages[-1].content
+    if not isinstance(latest_content, str) or not latest_content.strip():
+        return ""
+    latest = latest_content.strip()
+    if (
+        len(latest) >= _FOLLOW_UP_MAX_CHARS
+        and len(latest.split()) > _FOLLOW_UP_MAX_WORDS
+    ):
+        return latest
+    user_messages = [
+        message.content.strip()
+        for message in human_messages[:-1]
+        if isinstance(message.content, str) and message.content.strip()
+    ]
+    user_messages.append(latest)
+    return " ".join(user_messages[-_CONTEXT_TURNS:])
 
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     context: str
+    context_collection: str
 
 
 @lru_cache(maxsize=32)
@@ -74,10 +134,11 @@ def build_agent(
 ):
     """Compile the RAG graph bound to the selected provider and domain.
 
-    Cached per (provider, temperature, domain): the compiled graph is stateless
-    and reusable across requests. The domain selects both the system prompt and
-    the knowledge collection retrieval grounds on. Nodes are named so the trace
-    reads retrieve_context -> synthesize_answer -> (tools) -> validate_answer.
+    Cached per (provider, temperature, domain); per-conversation state lives in
+    the shared checkpointer, keyed by the request's thread_id. The domain selects
+    both the system prompt and the knowledge collection retrieval grounds on. Nodes
+    are named so the trace reads retrieve_context -> synthesize_answer ->
+    (tools) -> validate_answer.
     """
     model = make_chat_model(provider=provider, temperature=temperature)
     tools = tools_for_domain(domain)
@@ -91,6 +152,7 @@ def build_agent(
             if selected.system_prompt:
                 policy = BANK_TOOL_POLICY if domain == "bank" else TOOL_POLICY
                 prompt = selected.system_prompt + policy
+    prompt += FOLLOW_UP_POLICY
 
     def retrieve_context_node(state: AgentState) -> dict:
         """Retrieve grounding passages for the user's question (once per turn)."""
@@ -98,8 +160,17 @@ def build_agent(
         last = messages[-1] if messages else None
         if not isinstance(last, HumanMessage):
             return {"context": state.get("context", "")}
-        context, _hits = retrieve_context(last.content, collection=collection)
-        return {"context": context}
+        query = build_retrieval_query(messages) or last.content
+        context, _hits = retrieve_context(query, collection=collection)
+        if not context:
+            context_collection = collection or ""
+            if state.get("context_collection") == context_collection:
+                return {
+                    "context": state.get("context", ""),
+                    "context_collection": context_collection,
+                }
+            return {"context": "", "context_collection": context_collection}
+        return {"context": context, "context_collection": collection or ""}
 
     async def synthesize_answer_node(state: AgentState) -> dict:
         """Generate the answer from the retrieved context; may request a tool."""
@@ -138,4 +209,4 @@ def build_agent(
     )
     graph.add_edge("tools", "synthesize_answer")
     graph.add_edge("validate_answer", END)
-    return graph.compile()
+    return graph.compile(checkpointer=_CHECKPOINTER)

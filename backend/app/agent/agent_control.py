@@ -33,8 +33,15 @@ except Exception:  # noqa: BLE001
     class ControlViolationError(Exception):  # type: ignore[no-redef]
         """Fallback when the Agent Control SDK is not installed (deny action)."""
 
+        control_name: str = "unknown"
+        message: str = ""
+
     class ControlSteerError(Exception):  # type: ignore[no-redef]
         """Fallback when the Agent Control SDK is not installed (steer action)."""
+
+        control_name: str = "unknown"
+        message: str = ""
+        steering_context: str = ""
 
 
 # Decided once at import: controls only apply when explicitly enabled AND the SDK
@@ -209,3 +216,55 @@ def setup_agent_control() -> bool:
 async def evaluate_user_input(text: str) -> str:
     """Controlled step for the incoming user message (e.g. prompt-injection/PII)."""
     return text
+
+
+@control(step_name="assistant_output")
+async def evaluate_assistant_output(text: str) -> str:
+    """Controlled step for the final assistant answer (e.g. output PII/toxicity).
+
+    The answer is passed here as the step INPUT, so a console control that scores
+    the answer must read Payload Field = input (NOT output) and target this step.
+    """
+    return text
+
+
+def describe_control_error(exc: Exception) -> dict:
+    """Pull the control's identity and its own wording out of a control exception.
+
+    The SDK sets ``control_name``/``message`` on both error types and
+    ``steering_context`` on steers; the offline fallback stubs default them.
+    """
+    detail = ""
+    for candidate in (
+        getattr(exc, "steering_context", ""),
+        getattr(exc, "message", ""),
+    ):
+        if isinstance(candidate, dict):
+            candidate = candidate.get("message")
+        if not isinstance(candidate, str):
+            continue
+        candidate = candidate.strip()
+        if candidate and candidate != "No steering context provided":
+            detail = candidate
+            break
+    # No str(exc) fallback: its repr renders "…: None" when the server sends a null
+    # message. The raw text still reaches the UI via "reason" below.
+    return {
+        "action": "steer" if isinstance(exc, ControlSteerError) else "deny",
+        "control": str(getattr(exc, "control_name", "") or "unknown"),
+        "detail": detail,
+        "reason": f"Agent Control: {exc}",
+    }
+
+
+def control_block_message(info: dict) -> str:
+    if info["detail"]:
+        return (
+            f"Answer withheld — Galileo Agent Control ({info['control']}): "
+            f"{info['detail']}"
+        )
+    verb = "steered" if info["action"] == "steer" else "denied"
+    return (
+        f"Answer withheld — Galileo Agent Control {verb} this response "
+        f"(control: {info['control']})."
+    )

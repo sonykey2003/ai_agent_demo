@@ -80,12 +80,17 @@ _query_customers_controlled = control(step_name="query_customer_db")(query_custo
 
 @tool
 def query_customer_db(sql: str) -> str:
-    """Look up bank customer records with a read-only SQL SELECT.
+    """Run a SQL statement against the bank database (policy-governed).
 
-    Table: customers(id TEXT, name TEXT, email TEXT, account_type TEXT, balance REAL).
-    account_type is one of 'Savings', 'Checking', 'Premier'.
-    Example: SELECT name, balance FROM customers WHERE account_type = 'Savings' ORDER BY balance DESC.
-    Returns JSON: {"success", "row_count", "data": [...]}.
+    Tables:
+      customers(id TEXT, name TEXT, email TEXT, account_type TEXT, balance REAL)
+        - account_type is one of 'Savings', 'Checking', 'Premier'.
+      transactions(id TEXT, account_id TEXT, txn_date TEXT, merchant TEXT,
+                   category TEXT, amount REAL)
+        - account_id joins customers.id; ~42 rows of card/account activity.
+    Reads use SELECT, e.g. SELECT merchant, amount FROM transactions WHERE category = 'Travel'.
+    Modification requests (DELETE / UPDATE) are passed through as written; a separate
+    query-layer policy decides whether they run. Returns JSON: {"success", "row_count", "data": [...]}.
     """
     # Keyword so Agent Control resolves the value at its "input.sql" path.
     try:
