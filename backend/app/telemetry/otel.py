@@ -22,10 +22,16 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Span as SdkSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.sampling import (
+    ALWAYS_ON,
+    Decision,
+    ParentBased,
+    Sampler,
+    SamplingResult,
+)
 from opentelemetry.trace import Span, SpanKind
 
 from ..config import get_settings
-from .redacting_exporter import RedactingSpanExporter
 
 log = logging.getLogger(__name__)
 _initialized = False
@@ -69,40 +75,55 @@ def active_domain_scope(name: str | None) -> Iterator[None]:
         active_domain.reset(token)
 
 
-# Carries whether the app's built-in guardrails (incl. PII redaction) are active
-# for the current request. When false, the redacting exporter leaves spans raw so
-# an external guardrail (e.g. Galileo) can be demoed on the real input/output.
-active_guardrails_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "active_guardrails_enabled", default=True
+# Set for turns the native Galileo logger owns end to end. OTel's
+# suppress-instrumentation context key is only honoured by OTel-native
+# instrumentors, so OpenLLMetry's LangChain handler and this app's own manual
+# spans still emit and surface as a second, half-empty trace next to the native
+# one. Dropping at the sampler stops every span regardless of who created it.
+otel_muted: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "otel_muted", default=False
 )
 
 
 @contextmanager
-def active_guardrails_scope(enabled: bool) -> Iterator[None]:
-    """Scope the guardrails-enabled flag to one request."""
-    token = active_guardrails_enabled.set(enabled)
+def mute_otel_scope() -> Iterator[None]:
+    """Drop every OTel span created within this scope."""
+    token = otel_muted.set(True)
     try:
         yield
     finally:
-        active_guardrails_enabled.reset(token)
+        otel_muted.reset(token)
+
+
+class _MutableSampler(Sampler):
+    """Delegating sampler that drops spans while ``otel_muted`` is set."""
+
+    def __init__(self, delegate: Sampler) -> None:
+        self._delegate = delegate
+
+    def should_sample(self, *args, **kwargs) -> SamplingResult:  # noqa: D102
+        if otel_muted.get():
+            return SamplingResult(Decision.DROP)
+        return self._delegate.should_sample(*args, **kwargs)
+
+    def get_description(self) -> str:  # noqa: D102
+        return f"MutableSampler({self._delegate.get_description()})"
 
 
 class _DomainStampingSpanProcessor(SpanProcessor):
-    """Stamp per-request routing/policy attributes on every span at start.
+    """Stamp the routing attribute on every span at start.
 
     ``domain.name`` is set on the root turn span directly, but child spans
     (LLM, tool, retriever, LangGraph) are created by the instrumentor and would
-    otherwise lack it. Stamping at ``on_start`` from the per-request contextvars
-    puts them on all spans, so the Collector can route the whole trace to one
-    per-domain Galileo log stream and the redacting exporter can honor the
-    per-request guardrails toggle span-by-span.
+    otherwise lack it. Stamping at ``on_start`` from the per-request contextvar
+    puts it on all spans, so the Collector can route the whole trace to one
+    per-domain Galileo log stream.
     """
 
     def on_start(self, span: SdkSpan, parent_context: Context | None = None) -> None:
         domain = active_domain.get()
         if domain:
             span.set_attribute("domain.name", domain)
-        span.set_attribute("app.guardrails.enabled", active_guardrails_enabled.get())
 
     def on_end(self, span: SdkSpan) -> None:  # noqa: D102
         pass
@@ -209,11 +230,11 @@ def setup_telemetry(app=None) -> TracerProvider | None:
             "deployment.environment": settings.deployment_environment,
         }
     )
-    provider = TracerProvider(resource=resource)
+    provider = TracerProvider(
+        resource=resource, sampler=_MutableSampler(ParentBased(ALWAYS_ON))
+    )
     endpoint = settings.otel_exporter_otlp_endpoint.rstrip("/") + "/v1/traces"
     exporter = OTLPSpanExporter(endpoint=endpoint)
-    if settings.otel_redact_pii:
-        exporter = RedactingSpanExporter(exporter)
     # Runs before the exporter so every span carries domain.name for routing.
     provider.add_span_processor(_DomainStampingSpanProcessor())
     provider.add_span_processor(BatchSpanProcessor(exporter))

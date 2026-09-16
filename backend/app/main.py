@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,7 +25,6 @@ from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, Field
 
 from .agent.graph import build_agent
-from .agent.guardrails import get_guardrail
 from .agent.agent_control import (
     ControlSteerError,
     ControlViolationError,
@@ -47,7 +47,7 @@ from .rag.ingest import ingest_all
 from .telemetry.otel import (
     active_domain_scope,
     active_genai_system_scope,
-    active_guardrails_scope,
+    mute_otel_scope,
     set_guardrail_result,
     set_turn_input,
     set_turn_output,
@@ -112,7 +112,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_guardrail = get_guardrail()
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -121,10 +120,6 @@ class ChatRequest(BaseModel):
     provider: str | None = None
     domain: str | None = None
     temperature: float | None = None
-    # When false, the app's built-in input-block and output-PII-redaction
-    # guardrails are skipped so an external guardrail (e.g. Galileo) can be
-    # demoed on the raw input/output without interference.
-    guardrails_enabled: bool = True
     conversation_id: str = Field(
         default_factory=lambda: str(uuid4()), min_length=1, max_length=128
     )
@@ -132,6 +127,16 @@ class ChatRequest(BaseModel):
 
 def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _elapsed_ns(start: datetime | None, end: datetime | None) -> int | None:
+    if start is None or end is None:
+        return None
+    return max(int((end - start).total_seconds() * 1_000_000_000), 0)
 
 
 def _chunk_text(chunk) -> str:
@@ -160,7 +165,13 @@ _STEER_REVISION_PROMPT = (
 
 
 async def _revise_for_steer(
-    answer: str, guidance: str, req: ChatRequest, *, suppress_otel: bool
+    answer: str,
+    guidance: str,
+    req: ChatRequest,
+    *,
+    suppress_otel: bool,
+    native_logger=None,
+    model_name: str | None = None,
 ) -> str | None:
     """Rewrite `answer` per a steer control's steering context, then re-check it.
 
@@ -177,6 +188,7 @@ async def _revise_for_steer(
         if suppress_otel
         else None
     )
+    started = _utcnow()
     try:
         result = await model.ainvoke(
             [
@@ -188,6 +200,20 @@ async def _revise_for_steer(
         if token is not None:
             otel_context.detach(token)
     revised = _chunk_text(result).strip()
+    # Without this the re-check below reads as a second control set with no cause.
+    if native_logger is not None:
+        try:
+            native_logger.add_llm_span(
+                input=answer,
+                output=revised,
+                model=model_name,
+                name="Steer revision",
+                created_at=started,
+                duration_ns=_elapsed_ns(started, _utcnow()),
+                metadata={"steering_context": guidance},
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Could not log the steer-revision span.")
     if not revised:
         return None
     try:
@@ -198,7 +224,12 @@ async def _revise_for_steer(
 
 
 async def _resolve_output_control(
-    answer: str, req: ChatRequest, *, suppress_otel: bool = False
+    answer: str,
+    req: ChatRequest,
+    *,
+    suppress_otel: bool = False,
+    native_logger=None,
+    model_name: str | None = None,
 ) -> tuple[str, dict | None]:
     """Apply the output-side control: steer revises the answer, deny withholds it.
 
@@ -211,7 +242,12 @@ async def _resolve_output_control(
     except ControlSteerError as exc:
         info = describe_control_error(exc)
         revised = await _revise_for_steer(
-            answer, info["detail"], req, suppress_otel=suppress_otel
+            answer,
+            info["detail"],
+            req,
+            suppress_otel=suppress_otel,
+            native_logger=native_logger,
+            model_name=model_name,
         )
         info["revised"] = revised is not None
         if revised is not None:
@@ -288,8 +324,11 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
             log.exception("Agent Control input check failed; allowing the turn.")
 
         collected: list[str] = []
-        tool_calls: list[tuple[str, object, object]] = []
+        tool_calls: list[tuple[str, object, object, object, object]] = []
         pending_tools: dict = {}
+        retrieval: dict | None = None
+        retrieval_started = retrieval_ended = None
+        llm_started = llm_ended = None
         with rag_collection_scope(domain.collection):
             agent = build_agent(
                 provider=req.provider, temperature=req.temperature, domain=domain.name
@@ -305,61 +344,105 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
                     version="v2",
                 ):
                     kind = event.get("event")
-                    if kind == "on_chat_model_stream":
+                    if kind == "on_chain_start" and event.get("name") == "retrieve_context":
+                        retrieval_started = _utcnow()
+                    elif kind == "on_chain_end" and event.get("name") == "retrieve_context":
+                        # OTel is suppressed here, so the graph's retriever span never
+                        # ships; carry the evidence out and log it natively below.
+                        retrieval = event.get("data", {}).get("output") or None
+                        retrieval_ended = _utcnow()
+                    elif kind == "on_chat_model_start":
+                        # Reassigned per model call, so the last one wins: that is the
+                        # generation that produced the answer, after any tool round trip.
+                        llm_started = _utcnow()
+                    elif kind == "on_chat_model_end":
+                        llm_ended = _utcnow()
+                    elif kind == "on_chat_model_stream":
                         token = _chunk_text(event["data"]["chunk"])
                         if token:
+                            # Buffered, never streamed: an output-side control can only
+                            # score a finished answer, so nothing leaves the server until
+                            # it has cleared.
+                            if not collected:
+                                yield _sse({"type": "buffering"})
                             collected.append(token)
-                            yield _sse({"type": "token", "text": token})
                     elif kind == "on_tool_start":
                         name = event.get("name", "tool")
                         tin = event.get("data", {}).get("input")
-                        pending_tools[event.get("run_id")] = (name, tin)
+                        pending_tools[event.get("run_id")] = (name, tin, _utcnow())
                         yield _sse({"type": "tool", "name": name, "input": tin})
                     elif kind == "on_tool_end":
-                        name, tin = pending_tools.pop(event.get("run_id"), (None, None))
+                        name, tin, tstart = pending_tools.pop(
+                            event.get("run_id"), (None, None, None)
+                        )
                         if name:
                             tool_calls.append(
-                                (name, tin, event.get("data", {}).get("output"))
+                                (
+                                    name,
+                                    tin,
+                                    event.get("data", {}).get("output"),
+                                    tstart,
+                                    _utcnow(),
+                                )
                             )
             finally:
                 otel_context.detach(suppress)
 
+        # Retrieval ran inside the graph under OTel suppression, so replay it as a
+        # native retriever span -- this is what Galileo's RAG scorers read.
+        if retrieval and retrieval.get("documents"):
+            try:
+                logger.add_retriever_span(
+                    input=retrieval.get("retrieval_query") or req.message,
+                    output=retrieval["documents"],
+                    name="retrieve knowledge_base",
+                    created_at=retrieval_started,
+                    duration_ns=_elapsed_ns(retrieval_started, retrieval_ended),
+                    metadata={"collection": domain.collection},
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("Could not log the retriever span.")
+
         # Log tool calls (e.g. the bank customer DB query) as tool spans so the
         # DB step shows in the native trace alongside the control spans.
-        for tname, tin, tout in tool_calls:
+        for tname, tin, tout, tstart, tend in tool_calls:
             try:
                 logger.add_tool_span(
                     input=json.dumps(tin, default=str),
                     output=str(getattr(tout, "content", tout)),
                     name=tname,
+                    created_at=tstart,
+                    duration_ns=_elapsed_ns(tstart, tend),
                 )
             except Exception:  # noqa: BLE001
                 pass
 
         answer = "".join(collected)
         displayed_answer = answer
-        if req.guardrails_enabled:
-            gout = _guardrail.check_output(answer)
-            displayed_answer = (
-                gout.redacted_text if gout.redacted_text is not None else answer
-            )
-            if displayed_answer != answer:
-                yield _sse(
-                    {
-                        "type": "redacted",
-                        "text": displayed_answer,
-                        "source": "built-in",
-                    }
-                )
+        control_info: dict | None = None
+
+        # Logged before the output control so the trace reads retrieve -> tool ->
+        # llm -> output control, matching what actually happened.
+        logger.add_llm_span(
+            input=req.message,
+            output=answer,
+            model=cfg.model,
+            name="Agent Chat",
+            created_at=llm_started,
+            duration_ns=_elapsed_ns(llm_started, llm_ended or _utcnow()),
+        )
 
         # Output-side Agent Control. Galileo owns the outcome end to end (no built-in
         # regex redaction): a steer rewrites the answer with the control's steering
         # context, a deny withholds it.
         if agent_control_active():
-            control_info: dict | None = None
             try:
                 displayed_answer, control_info = await _resolve_output_control(
-                    answer, req, suppress_otel=True
+                    answer,
+                    req,
+                    suppress_otel=True,
+                    native_logger=logger,
+                    model_name=cfg.model,
                 )
             except Exception:  # noqa: BLE001
                 log.exception("Agent Control output check failed; showing answer as-is.")
@@ -386,12 +469,9 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
                     }
                 )
 
-        logger.add_llm_span(
-            input=req.message,
-            output=displayed_answer,
-            model=cfg.model,
-            name="Agent Chat",
-        )
+        if control_info is None:
+            yield _sse({"type": "answer", "text": displayed_answer})
+
         logger.conclude(output=displayed_answer)
         concluded = True
     except Exception as exc:  # noqa: BLE001
@@ -435,16 +515,17 @@ async def _event_stream(req: ChatRequest):
         and not otel_sink_active()
         and domain.name in settings.native_domains()
     ):
-        async for chunk in _agent_control_stream(req, cfg, domain):
-            yield chunk
+        # The native logger owns this turn's trace; muting OTel stops a second,
+        # LLM-less "invoke_agent LangGraph" trace landing beside it.
+        with mute_otel_scope(), active_domain_scope(domain.name):
+            async for chunk in _agent_control_stream(req, cfg, domain):
+                yield chunk
         return
 
     # The scope remains active for the full generator lifetime, so all nested
     # OpenLLMetry spans inherit this turn root and the real provider identity.
     with active_genai_system_scope(cfg.genai_system), active_domain_scope(
         domain.name
-    ), active_guardrails_scope(
-        req.guardrails_enabled
     ), rag_collection_scope(
         domain.collection
     ), start_chat_span(
@@ -454,7 +535,6 @@ async def _event_stream(req: ChatRequest):
         input_text=req.message,
     ) as turn_span:
         turn_span.set_attribute("domain.name", domain.name)
-        turn_span.set_attribute("app.guardrails.enabled", req.guardrails_enabled)
         yield _sse(
             {"type": "meta", "domain": domain.name, "collection": domain.collection}
         )
@@ -514,21 +594,6 @@ async def _event_stream(req: ChatRequest):
                 finally:
                     unbind_otel_trace_context()
 
-        if req.guardrails_enabled:
-            with start_guardrail_span("input") as guardrail_span:
-                gin = _guardrail.check_input(req.message)
-                set_guardrail_result(
-                    guardrail_span, allowed=gin.allowed, reason=gin.reason
-                )
-            if not gin.allowed:
-                turn_span.set_attribute("agent.result", "blocked")
-                set_turn_output(turn_span, gin.reason)
-                yield _sse(
-                    {"type": "guardrail", "stage": "input", "reason": gin.reason}
-                )
-                yield _sse({"type": "done"})
-                return
-
         collected: list[str] = []
         agent = build_agent(
             provider=req.provider, temperature=req.temperature, domain=domain.name
@@ -575,26 +640,9 @@ async def _event_stream(req: ChatRequest):
         answer = "".join(collected)
         displayed_answer = answer
         redacted = False
-        redacted_source = None
         redacted_control: dict | None = None
-        if req.guardrails_enabled:
-            with start_guardrail_span("output") as guardrail_span:
-                gout = _guardrail.check_output(answer)
-                displayed_answer = (
-                    gout.redacted_text if gout.redacted_text is not None else answer
-                )
-                redacted = displayed_answer != answer
-                if redacted:
-                    redacted_source = "built-in"
-                set_guardrail_result(
-                    guardrail_span,
-                    allowed=gout.allowed,
-                    reason=gout.reason,
-                    redacted=redacted,
-                )
-        # Output-side Agent Control, independent of the built-in toggle. Galileo owns
-        # the outcome: a steer rewrites the answer with the control's steering context,
-        # a deny withholds it (no built-in regex redaction either way).
+        # Output-side Agent Control: Galileo owns the outcome. A steer rewrites the
+        # answer with the control's steering context, a deny withholds it.
         if agent_control_active():
             with start_guardrail_span("output") as ac_out:
                 ac_out.set_attribute("guardrail.provider", "galileo-agent-control")
@@ -622,7 +670,6 @@ async def _event_stream(req: ChatRequest):
                     unbind_otel_trace_context()
                 if control_info:
                     redacted = True
-                    redacted_source = "galileo-agent-control"
                     redacted_control = {
                         "control": control_info["control"],
                         "action": control_info["action"],
@@ -643,7 +690,11 @@ async def _event_stream(req: ChatRequest):
         set_turn_input(turn_span, req.message)
         set_turn_output(turn_span, displayed_answer)
         if redacted:
-            payload = {"type": "redacted", "text": displayed_answer, "source": redacted_source or "built-in"}
+            payload = {
+                "type": "redacted",
+                "text": displayed_answer,
+                "source": "galileo-agent-control",
+            }
             if redacted_control:
                 payload.update(redacted_control)
             yield _sse(payload)

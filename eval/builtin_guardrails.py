@@ -1,8 +1,9 @@
-"""Pluggable guardrail interface with a lightweight, dependency-free default.
+"""Regex guardrails kept purely as offline experiment scorers/baselines.
 
-The interface is deliberately generic. Swap ``get_guardrail()`` to return a
-Galileo Protect, NeMo Guardrails, or Presidio-backed implementation without
-touching the agent or the API layer.
+These used to run inside the application. The app now delegates every control
+decision to Galileo Agent Control, so this module exists only so
+``run_experiment.py`` can still measure a "naive in-app guardrail" leg against
+the Galileo-governed one. Nothing under ``backend/`` imports it.
 """
 
 from __future__ import annotations
@@ -11,7 +12,16 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
-from ..privacy import redact_pii
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3}\)?[\s-]?)\d{3}[\s-]?\d{4}\b")
+_SSN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+
+
+def redact_pii(text: str) -> str:
+    """Mask known PII patterns while preserving the surrounding content."""
+    redacted = _SSN.sub("[REDACTED-SSN]", text)
+    redacted = _EMAIL.sub("[REDACTED-EMAIL]", redacted)
+    return _PHONE.sub("[REDACTED-PHONE]", redacted)
 
 
 @dataclass
@@ -47,5 +57,7 @@ class DefaultGuardrail:
 
 
 def get_guardrail() -> Guardrail:
-    """Return the active guardrail implementation (swap vendors here)."""
+    """Return the baseline guardrail implementation used by the experiment."""
     return DefaultGuardrail()
+</content>
+</invoke>

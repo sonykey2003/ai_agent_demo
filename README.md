@@ -159,15 +159,16 @@ would otherwise create a detached, empty HTTP trace.
 
 ## Privacy boundary
 
-`OTEL_REDACT_PII=true` wraps the OTLP trace exporter and masks known email,
-phone, and US SSN patterns in all string-valued span attributes and span-event
-attributes. This includes JSON strings stored in `gen_ai.input.messages`,
-`gen_ai.output.messages`, `input.value`, and `output.value`. Non-PII content is
-retained so content-based Galileo metrics can still run.
+The app applies no redaction of its own. Spans carry the real input and output
+(`gen_ai.input.messages`, `gen_ai.output.messages`, `input.value`,
+`output.value`) so Galileo's Input/Output PII scorers and Agent Control evaluate
+the content a user actually sent, and so a control's decision is the only thing
+that can withhold or rewrite an answer.
 
-Redaction occurs in the application before the first OTLP hop. It does not
-redact stdout application logs. Production deployments should avoid logging
-sensitive values or add a separate logging filter/pipeline.
+That means any PII in a turn reaches the observability backend. Production
+deployments should add redaction in the Collector (e.g. a `transform` or
+`redaction` processor) rather than in the app, keeping the control plane in one
+place. Application stdout logs are likewise unfiltered.
 
 ## Token usage
 

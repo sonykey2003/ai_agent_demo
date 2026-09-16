@@ -1,6 +1,6 @@
 """Tiny SQLite bank database backing the bank-domain query tool (demo only).
 
-Seeded in the container's ephemeral storage on first use. Two tables:
+Re-seeded in the container's ephemeral storage before every query. Two tables:
 ``customers`` (has name/email, so it drives the PII-control demo) and
 ``transactions`` (a deliberately PII-free ledger, so the SQL row-limit steer can
 be demoed without an output-PII control withholding the answer). Fake data only.
@@ -15,7 +15,6 @@ from pathlib import Path
 
 _DB_PATH = Path("/tmp/bank_customers.db")
 _lock = threading.Lock()
-_ready = False
 
 # (id, name, email, account_type, balance) — fabricated demo data only.
 _CUSTOMERS = [
@@ -59,73 +58,72 @@ def _seed_transactions() -> list[tuple[str, str, str, str, str, float]]:
     return rows
 
 
-def _ensure_db() -> None:
-    global _ready
-    if _ready:
-        return
-    with _lock:
-        if _ready:
-            return
-        conn = sqlite3.connect(_DB_PATH)
-        try:
-            conn.executescript(
-                """
-                DROP TABLE IF EXISTS customers;
-                CREATE TABLE customers (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    email TEXT NOT NULL,
-                    account_type TEXT NOT NULL,
-                    balance REAL NOT NULL
-                );
-                DROP TABLE IF EXISTS transactions;
-                CREATE TABLE transactions (
-                    id TEXT PRIMARY KEY,
-                    account_id TEXT NOT NULL,
-                    txn_date TEXT NOT NULL,
-                    merchant TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    amount REAL NOT NULL
-                );
-                """
-            )
-            conn.executemany(
-                "INSERT INTO customers (id, name, email, account_type, balance) "
-                "VALUES (?, ?, ?, ?, ?)",
-                _CUSTOMERS,
-            )
-            conn.executemany(
-                "INSERT INTO transactions "
-                "(id, account_id, txn_date, merchant, category, amount) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                _seed_transactions(),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        _ready = True
+def _seed_db() -> None:
+    """Re-seed from scratch before every query.
+
+    The tool executes whatever SQL it is given -- Galileo Agent Control is the
+    only thing that may refuse a statement -- so a destructive query really does
+    mutate the demo tables. Re-seeding per call lets the next turn start clean.
+    """
+    conn = sqlite3.connect(_DB_PATH)
+    try:
+        conn.executescript(
+            """
+            DROP TABLE IF EXISTS customers;
+            CREATE TABLE customers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                account_type TEXT NOT NULL,
+                balance REAL NOT NULL
+            );
+            DROP TABLE IF EXISTS transactions;
+            CREATE TABLE transactions (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                txn_date TEXT NOT NULL,
+                merchant TEXT NOT NULL,
+                category TEXT NOT NULL,
+                amount REAL NOT NULL
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO customers (id, name, email, account_type, balance) "
+            "VALUES (?, ?, ?, ?, ?)",
+            _CUSTOMERS,
+        )
+        conn.executemany(
+            "INSERT INTO transactions "
+            "(id, account_id, txn_date, merchant, category, amount) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            _seed_transactions(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def query_customers(sql: str) -> str:
-    """Execute a read-only ``SELECT`` against the demo bank tables.
+    """Execute the given SQL against the demo bank tables, whatever it is.
 
-    Non-SELECT statements are refused so the demo DB can't be mutated; that guard
-    is a safety net independent of any Agent Control policy on this step.
-    Returns a JSON string: ``{"success", "row_count", "data": [...]}``.
+    There is deliberately no statement allow-list here: Galileo Agent Control is
+    the only thing that may refuse a query, so an unguarded demo shows the real
+    consequence. Returns ``{"success", "row_count", "data": [...]}`` as JSON.
     """
-    _ensure_db()
     statement = sql.strip().rstrip(";").strip()
-    if not statement.lower().startswith("select"):
-        return json.dumps(
-            {"success": False, "error": "Only SELECT queries are allowed.",
-             "row_count": 0, "data": []}
-        )
     with _lock:
+        _seed_db()
         conn = sqlite3.connect(_DB_PATH)
         try:
             cur = conn.cursor()
             cur.execute(statement)
-            cols = [d[0] for d in cur.description] if cur.description else []
+            if cur.description is None:
+                conn.commit()
+                return json.dumps(
+                    {"success": True, "rows_affected": cur.rowcount, "data": []}
+                )
+            cols = [d[0] for d in cur.description]
             data = [dict(zip(cols, row)) for row in cur.fetchall()]
             return json.dumps({"success": True, "row_count": len(data), "data": data})
         except sqlite3.Error as exc:

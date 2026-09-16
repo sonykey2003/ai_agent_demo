@@ -124,6 +124,10 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     context: str
     context_collection: str
+    # Retrieval evidence carried in state so a caller that owns the trace (the
+    # native Galileo path) can log a retriever step it cannot see via OTel.
+    retrieval_query: str
+    documents: list
 
 
 @lru_cache(maxsize=32)
@@ -161,16 +165,39 @@ def build_agent(
         if not isinstance(last, HumanMessage):
             return {"context": state.get("context", "")}
         query = build_retrieval_query(messages) or last.content
-        context, _hits = retrieve_context(query, collection=collection)
+        context, hits = retrieve_context(query, collection=collection)
         if not context:
             context_collection = collection or ""
             if state.get("context_collection") == context_collection:
                 return {
                     "context": state.get("context", ""),
                     "context_collection": context_collection,
+                    "retrieval_query": query,
+                    "documents": state.get("documents", []),
                 }
-            return {"context": "", "context_collection": context_collection}
-        return {"context": context, "context_collection": collection or ""}
+            return {
+                "context": "",
+                "context_collection": context_collection,
+                "retrieval_query": query,
+                "documents": [],
+            }
+        return {
+            "context": context,
+            "context_collection": collection or "",
+            "retrieval_query": query,
+            "documents": [
+                {
+                    "content": doc["content"],
+                    "metadata": {
+                        "id": doc["id"],
+                        "title": doc["title"],
+                        "source": doc["source"],
+                        "score": f"{float(score):.4f}",
+                    },
+                }
+                for doc, score in hits
+            ],
+        }
 
     async def synthesize_answer_node(state: AgentState) -> dict:
         """Generate the answer from the retrieved context; may request a tool."""

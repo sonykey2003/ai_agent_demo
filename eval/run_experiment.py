@@ -198,18 +198,24 @@ def _multiturn_dataset() -> list[dict]:
 
 
 def _import_app():
-    """Import the app's real retrieval/guardrail/agent/telemetry code."""
+    """Import the app's real retrieval/agent/telemetry code.
+
+    The guardrail/PII helpers are eval-only (``eval/builtin_guardrails.py``): the
+    app itself no longer ships a built-in control, so the "guardrails on" leg is
+    a baseline this harness applies around the app rather than inside it.
+    """
     sys.path.insert(0, str(REPO_ROOT / "backend"))
+    sys.path.insert(0, str(REPO_ROOT / "eval"))
     from app.agent.graph import build_agent  # noqa: PLC0415
-    from app.agent.guardrails import get_guardrail  # noqa: PLC0415
     from app.config import get_settings  # noqa: PLC0415
     from app.domains import get_domains  # noqa: PLC0415
-    from app.privacy import redact_pii  # noqa: PLC0415
     from app.telemetry.otel import (  # noqa: PLC0415
         set_guardrail_result,
         start_chat_span,
         start_guardrail_span,
     )
+
+    from builtin_guardrails import get_guardrail, redact_pii  # noqa: PLC0415
 
     return {
         "build_agent": build_agent,

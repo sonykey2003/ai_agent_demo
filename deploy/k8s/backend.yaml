@@ -50,8 +50,6 @@ spec:
               value: "agent-chat-demo"
             - name: DEPLOYMENT_ENVIRONMENT
               value: "k8s-demo"
-            - name: OTEL_REDACT_PII
-              value: "true"
             - name: LLM_STREAM_USAGE
               value: "true"
           envFrom:

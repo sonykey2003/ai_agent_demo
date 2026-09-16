@@ -81,7 +81,6 @@ class Settings(BaseSettings):
     otel_exporter_otlp_endpoint: str = "http://localhost:4318"
     otel_service_name: str = "agent-chat-demo"
     deployment_environment: str = "demo"
-    otel_redact_pii: bool = True
 
     # --- Optional Galileo Agent Control (opt-in; native SDK, not OTel) ---
     agent_control_enabled: bool = False
