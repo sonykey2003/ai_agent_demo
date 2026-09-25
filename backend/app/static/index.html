@@ -251,8 +251,6 @@
             let evt;
             try { evt = JSON.parse(raw.slice(5).trim()); } catch { continue; }
             if (evt.type === "token") { acc += evt.text; bubble.textContent = acc; }
-            else if (evt.type === "buffering") { bubble.textContent = "⏳ generating…"; }
-            else if (evt.type === "answer") { acc = evt.text; bubble.textContent = acc; }
             else if (evt.type === "meta") addNotice("📚 grounding on domain: " + evt.domain + " · " + evt.collection);
             else if (evt.type === "tool") addNotice("🔧 tool · " + evt.name, "tool");
             else if (evt.type === "guardrail") { addNotice("🛡️ blocked (" + evt.stage + ") · Galileo Agent Control: " + evt.reason, "guard"); }

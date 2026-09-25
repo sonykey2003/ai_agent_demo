@@ -59,11 +59,11 @@ def test_chat_request_generates_distinct_conversation_ids() -> None:
     ).conversation_id
 
 
-def test_gemma_is_available_as_an_ollama_provider() -> None:
-    gemma = Settings(_env_file=None).providers()["local_gemma"]
+def test_openrouter_is_available_as_a_provider() -> None:
+    openrouter = Settings(_env_file=None).providers()["openrouter"]
 
-    assert gemma.model == "gemma4:latest"
-    assert gemma.genai_system == "ollama"
+    assert openrouter.base_url == "https://openrouter.ai/api/v1"
+    assert openrouter.genai_system == "openrouter"
 
 
 async def _events(request: ChatRequest) -> list[dict]:

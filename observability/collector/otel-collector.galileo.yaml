@@ -79,11 +79,6 @@ exporters:
   #   headers:
   #     Authorization: ${env:LANGFUSE_AUTH}
 
-  # Splunk Observability Cloud.
-  # otlphttp/splunk:
-  #   endpoint: https://ingest.${env:SPLUNK_REALM}.signalfx.com/v2/trace/otlp
-  #   headers:
-  #     X-SF-Token: ${env:SPLUNK_ACCESS_TOKEN}
 
 connectors:
   # Routes each span to a per-domain Galileo pipeline by the domain.name span

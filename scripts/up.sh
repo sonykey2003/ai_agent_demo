@@ -5,6 +5,11 @@ ollama_url="${OLLAMA_HOST_URL:-http://127.0.0.1:11434}"
 embedding_model="${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}"
 ollama_log="${TMPDIR:-/tmp}/ai-agent-demo-ollama.log"
 
+# Load environment variables from the Splunk .env file for APM & DBmon instrumentation
+splunk_env="/Users/shawsong/repo/demoAppsTemplate/splunk/.env"
+[ -f "$splunk_env" ] && source "$splunk_env"
+
+
 ollama_ready() {
     curl --fail --silent --max-time 2 "${ollama_url}/api/tags" >/dev/null 2>&1
 }

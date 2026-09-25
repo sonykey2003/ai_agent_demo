@@ -70,7 +70,7 @@ def run(dataset: Path, provider: str | None) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Offline agent evaluation")
-    parser.add_argument("--provider", default=None, help="openai | nim | local")
+    parser.add_argument("--provider", default=None, help="openai | openrouter | local")
     parser.add_argument(
         "--dataset",
         default=str(Path(__file__).parent / "datasets" / "smoke.jsonl"),

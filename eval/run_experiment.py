@@ -537,7 +537,7 @@ def main() -> int:
         default="both",
         help="Toggle the app guardrails. 'both' runs two experiments to compare.",
     )
-    parser.add_argument("--provider", default="local", help="openai | nim | local | local_gemma")
+    parser.add_argument("--provider", default="local", help="openai | openrouter | local")
     parser.add_argument(
         "--experiment-name",
         default=None,

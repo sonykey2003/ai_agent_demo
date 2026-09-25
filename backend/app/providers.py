@@ -1,6 +1,6 @@
 """Factory that builds an OpenAI-compatible chat model for any provider.
 
-Because OpenAI, NVIDIA NIM, and Ollama all expose the same wire protocol, the only
+Because OpenAI, OpenRouter, and Ollama all expose the same wire protocol, the only
 thing that changes between them is ``base_url`` / ``model`` / ``api_key``.
 """
 
@@ -33,7 +33,7 @@ def make_chat_model(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
         model=cfg.model,
-        # Names the LLM span after the real provider (e.g. "NVIDIA NIM.chat")
+        # Names the LLM span after the real provider (e.g. "OpenRouter.chat")
         # instead of the shared client class ("ChatOpenAI.chat").
         name=cfg.display,
         temperature=settings.temperature if temperature is None else temperature,

@@ -4,19 +4,15 @@ Vendor-neutral LangGraph chat demo instrumented with OpenTelemetry GenAI
 semantic conventions. The app exports OTLP to a local Collector, which routes
 traces to Galileo or another configured backend.
 
-The model dropdown includes OpenAI, NVIDIA NIM, local Qwen, and local Gemma 4.
-Install the local models before selecting them:
+The model dropdown includes OpenAI, OpenRouter (free-tier Nemotron
+3), and local Ollama. Install the local models before selecting them:
 
 ```bash
 ollama pull qwen2.5:0.5b
-ollama pull gemma4:latest
 ollama pull nomic-embed-text
 ```
 
-The included Kubernetes Ollama manifest only pre-pulls the small Qwen model and
-uses a 5 GiB model volume. To select Gemma against that deployment, provide an
-Ollama endpoint with `gemma4:latest` already installed and sufficient storage
-and memory.
+OpenRouter requires `OPENROUTER_API_KEY` in `.env`.
 
 ## Vector RAG
 
@@ -122,9 +118,10 @@ fire the only real LLM tool, `calculator`.
 - What's (1250 * 3) + 499?
 - Compute 2 ** 10 / 4.
 
-Tool-calling reliability depends on the model: OpenAI and NVIDIA NIM call the
+Tool-calling reliability depends on the model: OpenAI and OpenRouter call the
 tool consistently; the tiny local `qwen2.5:0.5b` often answers arithmetic inline
-without a tool call. Select OpenAI or NIM to demo a guaranteed `calculator` span.
+without a tool call. Select OpenAI or OpenRouter to demo a guaranteed
+`calculator` span.
 
 The Kubernetes backend uses the same integrated startup ingestion. Build the
 backend image from the repository root and deploy PostgreSQL, Ollama, and the
@@ -143,19 +140,37 @@ backend deployment after changing bundled knowledge to rebuild the collection.
 
 ## Trace model
 
-Every `/chat` turn creates one explicit `invoke_agent Agent Chat` root span. The
-OpenLLMetry LangGraph, LLM, tool, and manually-created retriever spans are nested
-under that root. Input-blocked requests still produce a trace containing the
-turn root and an input-guardrail child.
+Every `/chat` turn creates one trace rooted at a `POST /chat` span of kind
+`SERVER`, with an `invoke_agent Agent Chat` GenAI span directly beneath it. The
+OpenLLMetry LangGraph, LLM, tool, and manually-created retriever spans nest under
+that GenAI span. Input-blocked requests still produce a trace containing the turn
+root and an input-guardrail child.
+
+The SERVER span is what makes the app register as a service in APM backends that
+build their service list and service map from entry-point spans; without it the
+trace is GenAI-only and surfaces only in GenAI/agent views. It is created inside
+the SSE generator so it encloses the agent work.
 
 The browser generates one conversation ID when the page loads and sends it with
 every turn. The backend records it as `gen_ai.conversation.id` and `session.id`,
 so separate turn traces can be grouped into one conversation. Non-browser API
 clients may omit it and receive a generated ID per request.
 
-FastAPI auto-instrumentation is intentionally disabled. The agent executes in an
-SSE response generator after a conventional HTTP server span would close, which
-would otherwise create a detached, empty HTTP trace.
+FastAPI auto-instrumentation is intentionally disabled, and the manual SERVER
+span replaces it. The agent executes in an SSE response generator after a
+conventional HTTP server span would close, so auto-instrumentation produces a
+detached, empty HTTP trace alongside the real one.
+
+## Logs
+
+When telemetry is enabled the app also exports application logs over OTLP to the
+same Collector. A `LoggingHandler` is attached to the root logger, so every log
+record carries the same resource (`service.name`, `deployment.environment`) plus
+the active `trace_id` and `span_id` — which is what makes logs correlate with
+traces. Container stdout alone would not.
+
+Turns handled by the native Galileo path (see Agent Control) drop their spans at
+the sampler, so logs from those turns carry a zero trace ID.
 
 ## Privacy boundary
 
@@ -168,7 +183,8 @@ that can withhold or rewrite an answer.
 That means any PII in a turn reaches the observability backend. Production
 deployments should add redaction in the Collector (e.g. a `transform` or
 `redaction` processor) rather than in the app, keeping the control plane in one
-place. Application stdout logs are likewise unfiltered.
+place. Application logs are likewise unfiltered, and they are exported over OTLP
+as well as written to stdout, so the same caveat applies to the log backend.
 
 ## Token usage
 
@@ -206,11 +222,16 @@ One `.env` switch picks the Collector config (see the Langfuse block in
 
 ```bash
 # OTEL_COLLECTOR_CONFIG options:
-#   otel-collector.yaml          -> Galileo only (default)
-#   otel-collector.langfuse.yaml -> Langfuse only
-#   otel-collector.fanout.yaml   -> BOTH at once (side-by-side)
-OTEL_COLLECTOR_CONFIG=otel-collector.fanout.yaml
+#   otel-collector.galileo.yaml          -> Galileo only (default)
+#   otel-collector.langfuse.yaml         -> Langfuse only
+#   otel-collector.galileo-langfuse.yaml -> BOTH at once (side-by-side)
+OTEL_COLLECTOR_CONFIG=otel-collector.galileo-langfuse.yaml
 ```
+
+`otel-collector.apm-dbmon.yaml` is always merged on top of whichever config is
+selected, as a second `--config` flag. It adds the Splunk destinations described
+below. Collector config merging is a deep merge in which maps combine and lists
+are replaced, so the overlay restates the whole `traces/in` exporter list.
 
 Then:
 
@@ -237,18 +258,67 @@ the per-turn `session.id` groups turns into a Langfuse session — all from the
 app's existing spans. PII redaction still runs in the app before the first OTLP
 hop, so Langfuse receives the same masked content as Galileo.
 
-The app tags traces with `deployment.environment=demo`, which Langfuse maps to an
-environment. In the Langfuse UI, select the **demo** environment (the UI defaults
-to `default`) or the trace list looks empty. Langfuse v4 stores traces in its new
-event model, so use the Observations view / Observations API v2 — the legacy
-`/api/public/traces` endpoint is retired.
+The app tags traces with `deployment.environment`, set by `DEPLOYMENT_ENVIRONMENT`
+in `.env` (the demo uses `shawn-sao-demo`). Langfuse maps this to an environment;
+in the Langfuse UI select that environment (the UI defaults to `default`) or the
+trace list looks empty. Langfuse v4 stores traces in its new event model, so use
+the Observations view / Observations API v2 — the legacy `/api/public/traces`
+endpoint is retired.
 
-With `otel-collector.fanout.yaml` every trace goes to Galileo **and** Langfuse at
-once (verified: one chat lands in the Galileo `platform` log stream and the
-Langfuse project simultaneously) — ideal for a side-by-side comparison. The
-single-backend configs keep them mutually exclusive. Switch back to Galileo-only
-by setting `OTEL_COLLECTOR_CONFIG=otel-collector.yaml` and recreating the
-Collector.
+With `otel-collector.galileo-langfuse.yaml` every trace goes to Galileo **and**
+Langfuse at once (verified: one chat lands in the Galileo `platform` log stream
+and the Langfuse project simultaneously) — ideal for a side-by-side comparison.
+The single-backend configs keep them mutually exclusive. Switch back to
+Galileo-only by setting `OTEL_COLLECTOR_CONFIG=otel-collector.galileo.yaml` and
+recreating the Collector.
+
+## Splunk Observability Cloud and Splunk Enterprise
+
+`otel-collector.apm-dbmon.yaml` is merged into every Collector start and adds
+three Splunk destinations. Its credentials come from the shared Splunk
+environment file, which `scripts/up.sh` sources; export `SPLUNK_REALM`,
+`SPLUNK_ACCESS_TOKEN` and `SPLUNK_LOCAL_HEC` before running Compose directly, or
+the Collector fails to start on an empty realm.
+
+- **APM traces** — the `traces/in` pipeline fans out to the routing connector
+  (Galileo/Langfuse) *and* to Splunk O11y. Because each trace is rooted at a
+  `SERVER` span, the app appears in APM under Applications & services as
+  `agent-chat-demo` with endpoint `POST /chat`. The same spans carry `gen_ai.*`
+  attributes, so they also appear under Agent Observability.
+- **Database Monitoring** — a `postgresql` receiver scrapes the demo's pgvector
+  instance for metrics, query samples and top queries. The Compose network alias
+  `shawn-sao-demo-postgres` is what DBMon keys the instance on, so the demo is
+  distinguishable in a shared org. The receiver's `otelu` role needs `SELECT` on
+  the application tables for execution plans; without it the Collector logs
+  `permission denied for table langchain_pg_embedding` and plans stay empty.
+- **Application logs** — the `logs/app` pipeline ships OTLP logs to a local
+  Splunk Enterprise container over HEC (`splunk_hec/local`, index
+  `ai_agent_demo`). The exporter flattens resource attributes into searchable HEC
+  fields, so `service.name` and `deployment.environment` are filterable and each
+  event carries `trace_id`/`span_id`:
+
+  ```
+  index=ai_agent_demo service.name="agent-chat-demo" trace_id=*
+  ```
+
+Benign noise to expect in the Collector log: `failed to explain statement: pq:
+syntax error` on top queries, because `pg_stat_statements` normalizes literals to
+`$N` placeholders that cannot always be re-parsed.
+
+## Load generation
+
+`scripts/loadgen.sh` drives chat traffic so traces, logs and database activity
+appear in every configured backend:
+
+```bash
+./scripts/loadgen.sh                    # 5 rounds over the default domains
+ITERATIONS=20 DELAY=5 ./scripts/loadgen.sh
+DOMAINS="healthcare insurance" ./scripts/loadgen.sh
+```
+
+Bank is excluded by default: that domain runs the native Galileo path with OTel
+muted, so it emits no spans. Override with `DOMAINS="bank"` if you want its
+database activity without traces.
 
 ## Agent Control (optional runtime guardrail)
 

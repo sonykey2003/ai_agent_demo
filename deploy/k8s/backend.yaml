@@ -27,8 +27,6 @@ spec:
               value: "http://ollama:11434/v1"
             - name: LOCAL_MODEL
               value: "qwen2.5:0.5b"
-            - name: OLLAMA_GEMMA_MODEL
-              value: "gemma4:latest"
             - name: OLLAMA_EMBEDDING_BASE_URL
               value: "http://ollama:11434"
             - name: OLLAMA_EMBEDDING_MODEL
@@ -42,8 +40,8 @@ spec:
                 secretKeyRef:
                   name: agent-demo-secrets
                   key: POSTGRES_URL
-            - name: NIM_MODEL
-              value: "moonshotai/kimi-k2.6"
+            - name: OPENROUTER_MODEL
+              value: "nvidia/nemotron-3-ultra-550b-a55b-20260604:free"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://otel-collector:4318"
             - name: OTEL_SERVICE_NAME

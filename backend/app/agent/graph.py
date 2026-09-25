@@ -1,7 +1,7 @@
 """LangGraph agent definition.
 
 A custom graph with explicitly named nodes so the trace reads as a clean RAG
-pipeline (``retrieve_context -> synthesize_answer -> validate_answer``, with a
+pipeline (``retrieve_context -> <Domain> Assistant -> validate_answer``, with a
 ``tools`` node for the calculator) instead of the prebuilt ReAct agent's generic
 ``execute_task pre_model_hook / agent / should_continue`` node names.
 """
@@ -81,12 +81,14 @@ BANK_TOOL_POLICY = (
     "'update a balance'), write the matching SQL (DELETE / UPDATE) and call "
     "`query_customer_db` — do NOT refuse and do NOT lecture about safety; the query-layer "
     "policy decides whether it runs. Do NOT ask the user for a customer ID first, and do "
-    "NOT refuse on privacy grounds. If the tool returns a 'revise_query' message, rewrite "
-    "the SQL exactly as instructed and call `query_customer_db` again in the SAME turn, then "
-    "answer from the rows it returns — do NOT stop to explain the block, do NOT ask permission, "
-    "and do NOT offer to fetch the data in batches; if it returns 'blocked_by_policy', tell the "
-    "user the query was blocked by policy. General bank knowledge is still retrieved for "
-    "you automatically."
+    "NOT refuse on privacy grounds. If the tool returns a 'revise_query' message, call "
+    "`query_customer_db` exactly once more in the SAME turn: send the tool's `retry_with` "
+    "SQL verbatim when present, otherwise rewrite the `rejected_sql` per the guidance. "
+    "NEVER resubmit `rejected_sql` unchanged, and never issue a third attempt — "
+    "answer from the rows the retry returns. Do NOT stop to explain the block, do NOT ask "
+    "permission, and do NOT offer to fetch the data in batches; if it returns "
+    "'blocked_by_policy', tell the user the query was blocked by policy. General bank "
+    "knowledge is still retrieved for you automatically."
 )
 
 
@@ -120,6 +122,12 @@ def build_retrieval_query(messages: list) -> str:
     return " ".join(user_messages[-_CONTEXT_TURNS:])
 
 
+def assistant_node_name(domain: str | None) -> str:
+    """Trace-facing name of the LLM step, e.g. "Bank Assistant"."""
+    selected = get_domains().get(domain) if domain else None
+    return f"{selected.label} Assistant" if selected else "Assistant"
+
+
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     context: str
@@ -141,7 +149,7 @@ def build_agent(
     Cached per (provider, temperature, domain); per-conversation state lives in
     the shared checkpointer, keyed by the request's thread_id. The domain selects
     both the system prompt and the knowledge collection retrieval grounds on. Nodes
-    are named so the trace reads retrieve_context -> synthesize_answer ->
+    are named so the trace reads retrieve_context -> <Domain> Assistant ->
     (tools) -> validate_answer.
     """
     model = make_chat_model(provider=provider, temperature=temperature)
@@ -199,7 +207,7 @@ def build_agent(
             ],
         }
 
-    async def synthesize_answer_node(state: AgentState) -> dict:
+    async def assistant_node(state: AgentState) -> dict:
         """Generate the answer from the retrieved context; may request a tool."""
         context = state.get("context", "")
         system = (
@@ -218,22 +226,23 @@ def build_agent(
         span.set_attribute("validation.has_citation", "[" in text and "]" in text)
         return {}
 
-    def route_after_synthesize(state: AgentState) -> str:
+    def route_after_assistant(state: AgentState) -> str:
         last = state["messages"][-1]
         return "tools" if getattr(last, "tool_calls", None) else "validate_answer"
 
+    assistant = assistant_node_name(domain)
     graph = StateGraph(AgentState)
     graph.add_node("retrieve_context", retrieve_context_node)
-    graph.add_node("synthesize_answer", synthesize_answer_node)
+    graph.add_node(assistant, assistant_node)
     graph.add_node("tools", ToolNode(tools))
     graph.add_node("validate_answer", validate_answer_node)
     graph.add_edge(START, "retrieve_context")
-    graph.add_edge("retrieve_context", "synthesize_answer")
+    graph.add_edge("retrieve_context", assistant)
     graph.add_conditional_edges(
-        "synthesize_answer",
-        route_after_synthesize,
+        assistant,
+        route_after_assistant,
         {"tools": "tools", "validate_answer": "validate_answer"},
     )
-    graph.add_edge("tools", "synthesize_answer")
+    graph.add_edge("tools", assistant)
     graph.add_edge("validate_answer", END)
     return graph.compile(checkpointer=_CHECKPOINTER)

@@ -105,7 +105,7 @@ def main() -> int:
         action="store_true",
         help="After upload, run a baseline experiment scoring adherence metrics.",
     )
-    parser.add_argument("--provider", default="local", help="openai | nim | local | local_gemma")
+    parser.add_argument("--provider", default="local", help="openai | openrouter | local")
     args = parser.parse_args()
 
     _load_dotenv()

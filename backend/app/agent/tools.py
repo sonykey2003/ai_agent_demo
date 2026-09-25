@@ -7,6 +7,7 @@ import contextvars
 import json
 import logging
 import operator
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -77,6 +78,25 @@ query_customers.name = "query_customer_db"
 query_customers.tool_name = "query_customer_db"
 _query_customers_controlled = control(step_name="query_customer_db")(query_customers)
 
+_ROW_CAP_RE = re.compile(r"\b(\d+)\b")
+_HAS_LIMIT_RE = re.compile(r"\blimit\b", re.IGNORECASE)
+
+
+def _revised_sql(sql: str, guidance: str) -> str | None:
+    """Apply a row-cap steer to `sql` so the retry is one deterministic call.
+
+    Returning only prose guidance makes the model resubmit the identical SQL and
+    trip the control a second time; handing it the exact statement to re-send
+    keeps the turn at one steered call plus one allowed call.
+    """
+    statement = sql.strip().rstrip(";").strip()
+    if not statement.lower().startswith("select") or _HAS_LIMIT_RE.search(statement):
+        return None
+    cap = _ROW_CAP_RE.search(guidance)
+    if not cap:
+        return None
+    return f"{statement} LIMIT {cap.group(1)}"
+
 
 @tool
 def query_customer_db(sql: str) -> str:
@@ -91,6 +111,8 @@ def query_customer_db(sql: str) -> str:
     Reads use SELECT, e.g. SELECT merchant, amount FROM transactions WHERE category = 'Travel'.
     Modification requests (DELETE / UPDATE) are passed through as written; a separate
     query-layer policy decides whether they run. Returns JSON: {"success", "row_count", "data": [...]}.
+    If the policy steers the query the result is {"success": false, "revise_query", "rejected_sql",
+    "retry_with"} — call this tool once more with "retry_with" verbatim; never resend "rejected_sql".
     """
     # Keyword so Agent Control resolves the value at its "input.sql" path.
     try:
@@ -98,9 +120,16 @@ def query_customer_db(sql: str) -> str:
     except ControlSteerError as exc:
         # Steer: return the guidance so the model revises the SQL and retries.
         guidance = str(getattr(exc, "steering_context", "") or exc)
-        return json.dumps(
-            {"success": False, "revise_query": guidance, "data": []}
-        )
+        payload = {
+            "success": False,
+            "revise_query": guidance,
+            "rejected_sql": sql,
+            "data": [],
+        }
+        retry_with = _revised_sql(sql, guidance)
+        if retry_with:
+            payload["retry_with"] = retry_with
+        return json.dumps(payload)
     except ControlViolationError as exc:
         # Deny: report the block so the model tells the user (no retry).
         return json.dumps(

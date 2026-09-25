@@ -1,0 +1,77 @@
+receivers:
+  postgresql:
+    endpoint: shawn-sao-demo-postgres:5432
+    transport: tcp
+    username: ${env:DBMON_PG_USER}
+    password: ${env:DBMON_PG_PASSWORD}
+    collection_interval: 10s
+    tls:
+      insecure: true
+    metrics:
+      postgresql.vector.search.calls: {enabled: true}
+      postgresql.vector.search.duration: {enabled: true}
+      postgresql.vector.search.rows_returned: {enabled: true}
+      postgresql.vector.insert.rows: {enabled: true}
+      postgresql.vector.insert.duration: {enabled: true}
+    events:
+      db.server.query_sample: {enabled: true}
+      db.server.top_query: {enabled: true}
+    query_sample_collection:
+      max_rows_per_query: 100
+    top_query_collection:
+      top_n_query: 100
+      collection_interval: 60s
+
+processors:
+  resource/dbmon:
+    attributes:
+      - key: deployment.environment
+        value: shawn-sao-demo
+        action: upsert
+
+exporters:
+  signalfx:
+    access_token: ${env:SPLUNK_ACCESS_TOKEN}
+    realm: ${env:SPLUNK_REALM}
+  otlphttp/dbmon:
+    logs_endpoint: https://ingest.${env:SPLUNK_REALM}.observability.splunkcloud.com/v3/event
+    headers:
+      X-SF-Token: ${env:SPLUNK_ACCESS_TOKEN}
+      X-splunk-instrumentation-library: dbmon    # required literal
+    sending_queue:
+      batch:
+        flush_timeout: 15s
+        max_size: 10485760
+        sizer: bytes
+  otlphttp/splunk:
+    traces_endpoint: https://ingest.${env:SPLUNK_REALM}.signalfx.com/v2/trace/otlp
+    headers:
+      X-SF-Token: ${env:SPLUNK_ACCESS_TOKEN}
+  splunk_hec/local:
+    token: ${env:SPLUNK_LOCAL_HEC}
+    endpoint: https://host.docker.internal:8088/services/collector
+    index: ai_agent_demo
+    source: ai_agent_demo
+    sourcetype: otel:logs
+    tls:
+     insecure_skip_verify: true
+
+
+service:
+  pipelines:
+    metrics/dbmon:
+      receivers: [postgresql]
+      processors: [resource/dbmon, batch]
+      exporters: [signalfx]
+    logs/dbmon:
+      receivers: [postgresql]
+      processors: [resource/dbmon, batch]
+      exporters: [otlphttp/dbmon]
+    logs/app:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [splunk_hec/local]
+    traces/in:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [routing, otlphttp/splunk]

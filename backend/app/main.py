@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +25,7 @@ from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY
 from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, Field
 
-from .agent.graph import build_agent
+from .agent.graph import assistant_node_name, build_agent
 from .agent.agent_control import (
     ControlSteerError,
     ControlViolationError,
@@ -55,6 +56,7 @@ from .telemetry.otel import (
     shutdown_telemetry,
     start_chat_span,
     start_guardrail_span,
+    start_server_span,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -129,16 +131,6 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _elapsed_ns(start: datetime | None, end: datetime | None) -> int | None:
-    if start is None or end is None:
-        return None
-    return max(int((end - start).total_seconds() * 1_000_000_000), 0)
-
-
 def _chunk_text(chunk) -> str:
     """Extract text from a streamed chat-model chunk (string or content blocks)."""
     content = getattr(chunk, "content", "")
@@ -155,6 +147,105 @@ def _chunk_text(chunk) -> str:
     return str(content or "")
 
 
+_ROLES = {"human": "user", "ai": "assistant"}
+
+
+def _llm_message(m) -> dict | None:
+    """One LangChain message in Galileo's shape.
+
+    Returns None when the message would carry neither content nor tool calls:
+    Galileo rejects that with a 422 that silently drops the *whole* trace, and
+    it is exactly the shape of a tool-calling assistant turn.
+    """
+    kind = getattr(m, "type", "") or "user"
+    content = getattr(m, "content", m)
+    msg: dict = {
+        "role": _ROLES.get(kind, kind),
+        "content": content if isinstance(content, str) else str(content),
+    }
+    calls = [
+        {
+            "id": c.get("id") or "",
+            "function": {
+                "name": c.get("name") or "",
+                "arguments": json.dumps(c.get("args") or {}, default=str),
+            },
+        }
+        for c in (getattr(m, "tool_calls", None) or [])
+    ]
+    if calls:
+        msg["tool_calls"] = calls
+    tool_call_id = getattr(m, "tool_call_id", None)
+    if tool_call_id:
+        msg["tool_call_id"] = tool_call_id
+    if not msg["content"] and not calls:
+        return None
+    return msg
+
+
+def _llm_messages(raw) -> list[dict] | None:
+    """Flatten the messages the model actually saw, so context-grounding metrics
+    score against the injected passages rather than the bare user question."""
+    if not raw:
+        return None
+    msgs = raw[0] if isinstance(raw[0], list) else raw
+    out = [d for d in (_llm_message(m) for m in msgs) if d]
+    return out or None
+
+
+def _span_times(started_ns: int | None) -> dict:
+    """Real start/duration for a step; without them Galileo stamps the span at
+    flush time and the trace renders out of order against the control spans."""
+    if not started_ns:
+        return {}
+    return {
+        "created_at": datetime.fromtimestamp(started_ns / 1e9, tz=timezone.utc),
+        "duration_ns": time.time_ns() - started_ns,
+    }
+
+
+def _log_retriever_span(logger, output: dict, domain, fallback: str, started) -> None:
+    """Retrieval is a graph node, not a tool, so the native path has to re-declare
+    it from the state the node returns or RAG scorers get no documents."""
+    try:
+        logger.add_retriever_span(
+            input=output.get("retrieval_query") or fallback,
+            output=output.get("documents") or [],
+            name=f"retrieve {domain.collection}",
+            metadata={"collection": domain.collection},
+            **_span_times(started),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("could not log retriever span")
+
+
+def _log_llm_span(logger, model_input, output, model: str, started, name: str) -> None:
+    try:
+        logger.add_llm_span(
+            input=model_input,
+            output=_llm_message(output) or "",
+            model=model,
+            # Named for the graph node, not "Agent Chat" — that is the turn-root
+            # agent name, and reusing it made every reasoning step look identical.
+            name=name,
+            **_span_times(started),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("could not log llm span")
+
+
+def _log_tool_span(logger, name: str, tool_input, output, started) -> None:
+    try:
+        logger.add_tool_span(
+            input=json.dumps(tool_input, default=str),
+            output=str(getattr(output, "content", output)),
+            name=name,
+            **_span_times(started),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("could not log tool span")
+
+
 _STEER_REVISION_PROMPT = (
     "You are revising an assistant reply so it complies with a policy control.\n"
     "Policy guidance: {guidance}\n"
@@ -165,13 +256,7 @@ _STEER_REVISION_PROMPT = (
 
 
 async def _revise_for_steer(
-    answer: str,
-    guidance: str,
-    req: ChatRequest,
-    *,
-    suppress_otel: bool,
-    native_logger=None,
-    model_name: str | None = None,
+    answer: str, guidance: str, req: ChatRequest, *, suppress_otel: bool
 ) -> str | None:
     """Rewrite `answer` per a steer control's steering context, then re-check it.
 
@@ -188,7 +273,6 @@ async def _revise_for_steer(
         if suppress_otel
         else None
     )
-    started = _utcnow()
     try:
         result = await model.ainvoke(
             [
@@ -200,20 +284,6 @@ async def _revise_for_steer(
         if token is not None:
             otel_context.detach(token)
     revised = _chunk_text(result).strip()
-    # Without this the re-check below reads as a second control set with no cause.
-    if native_logger is not None:
-        try:
-            native_logger.add_llm_span(
-                input=answer,
-                output=revised,
-                model=model_name,
-                name="Steer revision",
-                created_at=started,
-                duration_ns=_elapsed_ns(started, _utcnow()),
-                metadata={"steering_context": guidance},
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("Could not log the steer-revision span.")
     if not revised:
         return None
     try:
@@ -224,12 +294,7 @@ async def _revise_for_steer(
 
 
 async def _resolve_output_control(
-    answer: str,
-    req: ChatRequest,
-    *,
-    suppress_otel: bool = False,
-    native_logger=None,
-    model_name: str | None = None,
+    answer: str, req: ChatRequest, *, suppress_otel: bool = False
 ) -> tuple[str, dict | None]:
     """Apply the output-side control: steer revises the answer, deny withholds it.
 
@@ -242,12 +307,7 @@ async def _resolve_output_control(
     except ControlSteerError as exc:
         info = describe_control_error(exc)
         revised = await _revise_for_steer(
-            answer,
-            info["detail"],
-            req,
-            suppress_otel=suppress_otel,
-            native_logger=native_logger,
-            model_name=model_name,
+            answer, info["detail"], req, suppress_otel=suppress_otel
         )
         info["revised"] = revised is not None
         if revised is not None:
@@ -324,11 +384,9 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
             log.exception("Agent Control input check failed; allowing the turn.")
 
         collected: list[str] = []
-        tool_calls: list[tuple[str, object, object, object, object]] = []
         pending_tools: dict = {}
-        retrieval: dict | None = None
-        retrieval_started = retrieval_ended = None
-        llm_started = llm_ended = None
+        pending_llm: dict = {}
+        pending_retrieval: dict = {}
         with rag_collection_scope(domain.collection):
             agent = build_agent(
                 provider=req.provider, temperature=req.temperature, domain=domain.name
@@ -338,111 +396,75 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
                 otel_context.set_value(_SUPPRESS_INSTRUMENTATION_KEY, True)
             )
             try:
+                # Spans are logged as each step ENDS, interleaved with the control
+                # spans the Agent Control bridge writes live, so the trace reads in
+                # execution order: retrieve -> llm -> control -> tool -> llm.
                 async for event in agent.astream_events(
                     {"messages": [("user", req.message)]},
                     config={"configurable": {"thread_id": req.conversation_id}},
                     version="v2",
                 ):
                     kind = event.get("event")
-                    if kind == "on_chain_start" and event.get("name") == "retrieve_context":
-                        retrieval_started = _utcnow()
-                    elif kind == "on_chain_end" and event.get("name") == "retrieve_context":
-                        # OTel is suppressed here, so the graph's retriever span never
-                        # ships; carry the evidence out and log it natively below.
-                        retrieval = event.get("data", {}).get("output") or None
-                        retrieval_ended = _utcnow()
+                    run_id = event.get("run_id")
+                    name = event.get("name", "")
+                    if kind == "on_chain_start" and name == "retrieve_context":
+                        pending_retrieval[run_id] = time.time_ns()
+                    elif kind == "on_chain_end" and name == "retrieve_context":
+                        started = pending_retrieval.pop(run_id, None)
+                        out = event.get("data", {}).get("output") or {}
+                        _log_retriever_span(logger, out, domain, req.message, started)
                     elif kind == "on_chat_model_start":
-                        # Reassigned per model call, so the last one wins: that is the
-                        # generation that produced the answer, after any tool round trip.
-                        llm_started = _utcnow()
-                    elif kind == "on_chat_model_end":
-                        llm_ended = _utcnow()
+                        pending_llm[run_id] = (
+                            _llm_messages(
+                                event.get("data", {}).get("input", {}).get("messages")
+                            ),
+                            time.time_ns(),
+                        )
                     elif kind == "on_chat_model_stream":
                         token = _chunk_text(event["data"]["chunk"])
                         if token:
-                            # Buffered, never streamed: an output-side control can only
-                            # score a finished answer, so nothing leaves the server until
-                            # it has cleared.
-                            if not collected:
-                                yield _sse({"type": "buffering"})
                             collected.append(token)
+                            yield _sse({"type": "token", "text": token})
+                    elif kind == "on_chat_model_end":
+                        msgs, started = pending_llm.pop(run_id, (None, None))
+                        _log_llm_span(
+                            logger,
+                            msgs or req.message,
+                            event.get("data", {}).get("output"),
+                            cfg.model,
+                            started,
+                            assistant_node_name(domain.name),
+                        )
                     elif kind == "on_tool_start":
-                        name = event.get("name", "tool")
                         tin = event.get("data", {}).get("input")
-                        pending_tools[event.get("run_id")] = (name, tin, _utcnow())
+                        pending_tools[run_id] = (name or "tool", tin, time.time_ns())
                         yield _sse({"type": "tool", "name": name, "input": tin})
                     elif kind == "on_tool_end":
-                        name, tin, tstart = pending_tools.pop(
-                            event.get("run_id"), (None, None, None)
+                        tname, tin, started = pending_tools.pop(
+                            run_id, (None, None, None)
                         )
-                        if name:
-                            tool_calls.append(
-                                (
-                                    name,
-                                    tin,
-                                    event.get("data", {}).get("output"),
-                                    tstart,
-                                    _utcnow(),
-                                )
+                        if tname:
+                            _log_tool_span(
+                                logger,
+                                tname,
+                                tin,
+                                event.get("data", {}).get("output"),
+                                started,
                             )
             finally:
                 otel_context.detach(suppress)
 
-        # Retrieval ran inside the graph under OTel suppression, so replay it as a
-        # native retriever span -- this is what Galileo's RAG scorers read.
-        if retrieval and retrieval.get("documents"):
-            try:
-                logger.add_retriever_span(
-                    input=retrieval.get("retrieval_query") or req.message,
-                    output=retrieval["documents"],
-                    name="retrieve knowledge_base",
-                    created_at=retrieval_started,
-                    duration_ns=_elapsed_ns(retrieval_started, retrieval_ended),
-                    metadata={"collection": domain.collection},
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("Could not log the retriever span.")
-
-        # Log tool calls (e.g. the bank customer DB query) as tool spans so the
-        # DB step shows in the native trace alongside the control spans.
-        for tname, tin, tout, tstart, tend in tool_calls:
-            try:
-                logger.add_tool_span(
-                    input=json.dumps(tin, default=str),
-                    output=str(getattr(tout, "content", tout)),
-                    name=tname,
-                    created_at=tstart,
-                    duration_ns=_elapsed_ns(tstart, tend),
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
         answer = "".join(collected)
         displayed_answer = answer
-        control_info: dict | None = None
-
-        # Logged before the output control so the trace reads retrieve -> tool ->
-        # llm -> output control, matching what actually happened.
-        logger.add_llm_span(
-            input=req.message,
-            output=answer,
-            model=cfg.model,
-            name="Agent Chat",
-            created_at=llm_started,
-            duration_ns=_elapsed_ns(llm_started, llm_ended or _utcnow()),
-        )
 
         # Output-side Agent Control. Galileo owns the outcome end to end (no built-in
         # regex redaction): a steer rewrites the answer with the control's steering
         # context, a deny withholds it.
         if agent_control_active():
+            control_info: dict | None = None
             try:
                 displayed_answer, control_info = await _resolve_output_control(
-                    answer,
-                    req,
-                    suppress_otel=True,
-                    native_logger=logger,
-                    model_name=cfg.model,
+                    answer, req, suppress_otel=True
                 )
             except Exception:  # noqa: BLE001
                 log.exception("Agent Control output check failed; showing answer as-is.")
@@ -468,9 +490,6 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
                         "revised": control_info["revised"],
                     }
                 )
-
-        if control_info is None:
-            yield _sse({"type": "answer", "text": displayed_answer})
 
         logger.conclude(output=displayed_answer)
         concluded = True
@@ -528,6 +547,8 @@ async def _event_stream(req: ChatRequest):
         domain.name
     ), rag_collection_scope(
         domain.collection
+    ), start_server_span(
+        method="POST", route="/chat"
     ), start_chat_span(
         conversation_id=req.conversation_id,
         provider_name=cfg.genai_system,
@@ -628,6 +649,7 @@ async def _event_stream(req: ChatRequest):
                             "input": event.get("data", {}).get("input"),
                         }
                     )
+            
         except Exception as exc:  # noqa: BLE001
             log.exception("agent error")
             turn_span.record_exception(exc)

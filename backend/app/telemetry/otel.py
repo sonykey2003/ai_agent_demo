@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 
 from opentelemetry import trace
@@ -31,11 +31,17 @@ from opentelemetry.sdk.trace.sampling import (
 )
 from opentelemetry.trace import Span, SpanKind
 
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+
 from ..config import get_settings
 
 log = logging.getLogger(__name__)
 _initialized = False
 _provider: TracerProvider | None = None
+_logger_provider: LoggerProvider | None = None
 _shutdown = False
 
 # Carries the real GenAI provider/system for the current request. Every provider
@@ -48,7 +54,7 @@ active_genai_system: contextvars.ContextVar[str | None] = contextvars.ContextVar
 
 
 @contextmanager
-def active_genai_system_scope(system: str | None) -> Iterator[None]:
+def active_genai_system_scope(system: str | None) -> Generator[None]:
     """Scope the provider override to one request and restore it afterwards."""
     token = active_genai_system.set(system)
     try:
@@ -66,7 +72,7 @@ active_domain: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 
 @contextmanager
-def active_domain_scope(name: str | None) -> Iterator[None]:
+def active_domain_scope(name: str | None) -> Generator[None]:
     """Scope the active domain to one request and restore it afterwards."""
     token = active_domain.set(name)
     try:
@@ -86,7 +92,7 @@ otel_muted: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 @contextmanager
-def mute_otel_scope() -> Iterator[None]:
+def mute_otel_scope() -> Generator[None]:
     """Drop every OTel span created within this scope."""
     token = otel_muted.set(True)
     try:
@@ -172,7 +178,7 @@ def start_chat_span(
     provider_name: str,
     model: str,
     input_text: str,
-) -> Iterator[Span]:
+) -> Generator[Span]:
     """Create the valid GenAI root span that owns one complete streamed turn."""
     tracer = trace.get_tracer("agent_chat.turn")
     with tracer.start_as_current_span(
@@ -189,7 +195,18 @@ def start_chat_span(
 
 
 @contextmanager
-def start_guardrail_span(stage: str) -> Iterator[Span]:
+def start_server_span(*, method: str, route: str) -> Generator[Span]:
+    """Entry-point span for APM; created inside the SSE generator so it wraps the real turn."""
+    tracer = trace.get_tracer("agent_chat.http")
+    with tracer.start_as_current_span(f"{method} {route}", kind=SpanKind.SERVER) as span:
+        span.set_attribute("http.request.method", method)
+        span.set_attribute("http.route", route)
+        span.set_attribute("url.path", route)
+        span.set_attribute("http.response.status_code", 200)
+        yield span
+
+@contextmanager
+def start_guardrail_span(stage: str) -> Generator[Span]:
     """Create a child span for a generic input or output guardrail check."""
     tracer = trace.get_tracer("agent_chat.guardrails")
     with tracer.start_as_current_span(f"guardrail {stage}") as span:
@@ -214,7 +231,7 @@ def set_guardrail_result(
 
 def setup_telemetry(app=None) -> TracerProvider | None:
     """Initialise tracing once and (optionally) instrument a FastAPI app."""
-    global _initialized, _provider, _shutdown
+    global _initialized, _provider, _shutdown, _logger_provider
     if _initialized:
         return _provider
 
@@ -239,6 +256,19 @@ def setup_telemetry(app=None) -> TracerProvider | None:
     provider.add_span_processor(_DomainStampingSpanProcessor())
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
+    _logger_provider = LoggerProvider(resource=resource)
+    _logger_provider.add_log_record_processor(
+        BatchLogRecordProcessor(
+            OTLPLogExporter(
+                endpoint=settings.otel_exporter_otlp_endpoint.rstrip("/") + "/v1/logs"
+            )
+        )
+    )
+    set_logger_provider(_logger_provider)
+    handler = LoggingHandler(level=logging.INFO, logger_provider=_logger_provider)
+    # Exporter failures log to root; re-exporting them would feed the exporter its own errors.
+    handler.addFilter(lambda record: not record.name.startswith("opentelemetry"))
+    logging.getLogger().addHandler(handler)
     _provider = provider
     _shutdown = False
 
@@ -297,4 +327,6 @@ def shutdown_telemetry() -> None:
         return
     force_flush_telemetry()
     _provider.shutdown()
+    if _logger_provider is not None:
+        _logger_provider.shutdown()
     _shutdown = True

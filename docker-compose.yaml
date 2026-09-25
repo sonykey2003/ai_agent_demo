@@ -1,5 +1,5 @@
 # Local laptop demo: backend (serves UI) + Ollama (tiny model) + OTel Collector.
-# Cloud providers (OpenAI / NVIDIA NIM) are reached over the internet via .env.
+# Cloud providers (OpenAI / OpenRouter) are reached over the internet via .env.
 
 services:
   backend:
@@ -54,6 +54,10 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: vectordb
+    networks:
+      default:
+       aliases:
+         - shawn-sao-demo-postgres
     ports:
       - "5433:5432"
     volumes:
@@ -63,20 +67,40 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.max=10000
+      - -c
+      - pg_stat_statements.track=all
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
-    command: ["--config=/etc/otelcol/config.yaml"]
+    command: 
+      - "--config=/etc/otelcol/config.yaml"
+      - "--config=/etc/otelcol/otel-collector.apm-dbmon.yaml"
     env_file: .env
+    environment:
+      SPLUNK_REALM: ${SPLUNK_REALM}
+      SPLUNK_ACCESS_TOKEN: ${SPLUNK_ACCESS_TOKEN}
+      SPLUNK_LOCAL_HEC: ${SPLUNK_LOCAL_HEC}
+      DBMON_PG_USER: otelu
+      DBMON_PG_PASSWORD: otelu
     volumes:
-      # Which backend the Collector routes to is a config swap, never app code.
       # Default = Galileo. Options for OTEL_COLLECTOR_CONFIG (in .env):
-      #   otel-collector.yaml (Galileo) | otel-collector.langfuse.yaml (Langfuse
-      #   Cloud) | otel-collector.fanout.yaml (both).
-      - ./observability/collector/${OTEL_COLLECTOR_CONFIG:-otel-collector.yaml}:/etc/otelcol/config.yaml:ro
+      #   otel-collector.galileo.yaml | otel-collector.langfuse.yaml |
+      #   otel-collector.galileo-langfuse.yaml (both).
+      #   otel-collector.apm-dbmon.yaml is always merged: Splunk O11y APM traces + DB monitoring.
+      - ./observability/collector/${OTEL_COLLECTOR_CONFIG:-otel-collector.galileo.yaml}:/etc/otelcol/config.yaml:ro
+      - ./observability/collector/otel-collector.apm-dbmon.yaml:/etc/otelcol/otel-collector.apm-dbmon.yaml:ro
     ports:
       - "4317:4317"
       - "4318:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres:

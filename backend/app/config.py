@@ -1,6 +1,6 @@
 """Application settings and the swappable LLM provider registry.
 
-All three providers (OpenAI, NVIDIA NIM, local Ollama) speak the OpenAI-compatible
+Every provider (OpenAI, OpenRouter, local Ollama) speaks the OpenAI-compatible
 API, so a single client with a configurable ``base_url`` / ``model`` / ``api_key``
 covers every backend. Switching is a config change, never a code change.
 """
@@ -21,14 +21,14 @@ class ProviderConfig(BaseModel):
     base_url: str
     api_key: str
     model: str
-    # Short provider name. Used as the LLM span name (e.g. "NVIDIA NIM") and the
+    # Short provider name. Used as the LLM span name (e.g. "OpenRouter") and the
     # gen_ai.provider.name attribute, so traces show the real provider even though
     # every backend is reached through the same OpenAI-compatible client class.
     display: str
     genai_system: str
     # Sampling caps. frequency_penalty > 0 tames repetition on a tiny local model
     # but degrades tool-calling / output quality on capable hosted models, so it is
-    # set per provider (0 for OpenAI / NIM).
+    # set per provider (0 for the hosted ones).
     max_tokens: int
     frequency_penalty: float
 
@@ -36,7 +36,7 @@ class ProviderConfig(BaseModel):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # Which provider to use by default: "openai" | "nim" | "local" | "local_gemma"
+    # Which provider to use by default: "openai" | "openrouter" | "local"
     llm_provider: str = "local"
     temperature: float = 0.2
     # Cap output length so a looping/runaway model can't stream forever.
@@ -50,15 +50,14 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
 
-    # --- NVIDIA NIM (hosted catalog or self-hosted microservice) ---
-    nvidia_api_key: str = ""
-    nim_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nim_model: str = "deepseek-ai/deepseek-r1"
+    # --- OpenRouter (multi-vendor gateway; free-tier models available) ---
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b-20260604:free"
 
     # --- Local tiny model via Ollama (OpenAI-compatible endpoint) ---
     ollama_base_url: str = "http://localhost:11434/v1"
     local_model: str = "qwen2.5:0.5b"
-    ollama_gemma_model: str = "gemma4:latest"
 
     # --- Retrieval-augmented generation (PostgreSQL + pgvector) ---
     rag_enabled: bool = True
@@ -129,14 +128,14 @@ class Settings(BaseSettings):
                 max_tokens=self.max_tokens,
                 frequency_penalty=0.0,
             ),
-            "nim": ProviderConfig(
-                name="nim",
-                label=f"NVIDIA NIM · {self.nim_model}",
-                base_url=self.nim_base_url,
-                api_key=self.nvidia_api_key or "missing",
-                model=self.nim_model,
-                display="NVIDIA NIM",
-                genai_system="nvidia_nim",
+            "openrouter": ProviderConfig(
+                name="openrouter",
+                label=f"OpenRouter · {self.openrouter_model}",
+                base_url=self.openrouter_base_url,
+                api_key=self.openrouter_api_key or "missing",
+                model=self.openrouter_model,
+                display="OpenRouter",
+                genai_system="openrouter",
                 max_tokens=self.max_tokens,
                 frequency_penalty=0.0,
             ),
@@ -146,17 +145,6 @@ class Settings(BaseSettings):
                 base_url=self.ollama_base_url,
                 api_key="ollama",  # Ollama ignores the key but the client requires one.
                 model=self.local_model,
-                display="Ollama",
-                genai_system="ollama",
-                max_tokens=self.max_tokens,
-                frequency_penalty=self.frequency_penalty,
-            ),
-            "local_gemma": ProviderConfig(
-                name="local_gemma",
-                label=f"Local Ollama · {self.ollama_gemma_model}",
-                base_url=self.ollama_base_url,
-                api_key="ollama",
-                model=self.ollama_gemma_model,
                 display="Ollama",
                 genai_system="ollama",
                 max_tokens=self.max_tokens,

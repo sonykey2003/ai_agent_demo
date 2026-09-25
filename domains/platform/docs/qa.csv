@@ -8,7 +8,7 @@ question,answer,source
 "What runs the agent and how are responses delivered to the browser?","A FastAPI backend runs a LangGraph ReAct agent and streams responses to the web interface using server-sent events.",architecture.md
 "When does retrieval happen relative to the model call?","A deterministic pre-model hook searches PostgreSQL with pgvector and adds relevant passages to the model input before the first model call.",architecture.md
 "How do telemetry spans leave the application in this demo?","OpenTelemetry spans flow through a local Collector to Galileo or any other configured OTLP backend.",architecture.md
-"Which model providers does the demo support?","The demo supports OpenAI, NVIDIA NIM, and local Ollama through OpenAI-compatible chat APIs.",providers.md
+"Which model providers does the demo support?","The demo supports OpenAI, OpenRouter, and local Ollama through OpenAI-compatible chat APIs.",providers.md
 "Which local models are available in the demo?","Local Qwen uses the qwen2.5:0.5b model and local Gemma uses gemma4:latest.",providers.md
 "How do the chat and embedding endpoints differ for Ollama?","Ollama serves the OpenAI-compatible chat API under /v1, while the native Ollama endpoint is used by the nomic-embed-text embedding model.",providers.md
 "What does context adherence measure?","Context adherence measures whether an answer is supported by the retrieved context.",rag-evaluation.md
