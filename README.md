@@ -169,10 +169,14 @@ Splunk APM ID    : 45de319b79424201b365e8e5a347eaeb   (same, without dashes)
 ```
 
 Turns on the native Galileo path (Agent Control native domains, `bank` by
-default) are different: the Galileo logger always mints its own trace ID. Those
-turns still emit the `POST /chat` and `invoke_agent Agent Chat` spans for APM,
-marked `telemetry.apm_only=true` so the Collector keeps them out of
-Galileo/Langfuse, and the two traces are cross-linked instead:
+default) build their Galileo trace with the native logger instead. Every OTel
+span of such a turn (entry, retrieval/Postgres, LLM, tools) is stamped
+`telemetry.apm_only=true`, so Splunk APM gets the full tree, including the
+inferred database and LLM services, while the Collector keeps those spans out of
+Galileo/Langfuse. The logger runs in batch mode by default, so the app gives the
+Galileo trace the OTel trace ID and the IDs match here too. As a fallback (e.g.
+`GALILEO_MODE=distributed`, where the ID cannot be changed) the traces are also
+cross-linked:
 
 - Galileo trace metadata `otel_trace_id` = the Splunk APM trace ID.
 - APM span attribute `galileo.trace_id` = the Galileo trace ID.
@@ -190,9 +194,8 @@ record carries the same resource (`service.name`, `deployment.environment`) plus
 the active `trace_id` and `span_id` — which is what makes logs correlate with
 traces. Container stdout alone would not.
 
-Turns handled by the native Galileo path (see Agent Control) mute their nested
-spans at the sampler; their logs carry the trace ID of the APM-only turn span,
-so they still correlate with the Splunk APM trace.
+Logs from turns on the native Galileo path (see Agent Control) carry the trace ID
+of their APM-only OTel spans, which is also the Galileo trace ID.
 
 ## Privacy boundary
 
@@ -340,9 +343,9 @@ ITERATIONS=20 DELAY=5 ./scripts/loadgen.sh
 DOMAINS="healthcare insurance" ./scripts/loadgen.sh
 ```
 
-Bank is excluded by default: that domain runs the native Galileo path, so it
-emits only the APM-only entry/turn spans over OTLP (its Galileo trace comes from
-the native logger). Override with `DOMAINS="bank"` to include it.
+Bank is excluded by default: that domain runs the native Galileo path (its
+Galileo trace comes from the native logger; its OTel spans go to APM only).
+Override with `DOMAINS="bank"` to include it.
 
 ## Agent Control (optional runtime guardrail)
 

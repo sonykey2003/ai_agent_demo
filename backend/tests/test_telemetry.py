@@ -8,7 +8,6 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
 from app import main
 from app.config import Settings
@@ -114,23 +113,24 @@ def test_trace_ids_survive_galileo_uuidv4_normalization() -> None:
         assert uuid.UUID(int=trace_id, version=4).int == trace_id
 
 
-def test_native_turn_emits_linked_apm_only_spans(monkeypatch) -> None:
+def test_native_turn_sends_full_apm_only_trace_with_shared_id(monkeypatch) -> None:
     exporter = InMemorySpanExporter()
-    provider = TracerProvider(
-        sampler=otel._MutableSampler(ALWAYS_ON),
-        id_generator=otel.UuidV4TraceIdGenerator(),
-    )
+    provider = TracerProvider(id_generator=otel.UuidV4TraceIdGenerator())
+    provider.add_span_processor(otel._DomainStampingSpanProcessor())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     monkeypatch.setattr(
         otel.trace, "get_tracer", lambda name, *a, **k: provider.get_tracer(name)
     )
 
     class FakeLogger:
+        mode = "batch"
         metadata = None
+        trace = None
 
         def start_trace(self, *, input, name, metadata=None):
             self.metadata = metadata
-            return SimpleNamespace(id="galileo-trace-1")
+            self.trace = SimpleNamespace(id=uuid.uuid4())
+            return self.trace
 
         def conclude(self, output):
             pass
@@ -140,7 +140,7 @@ def test_native_turn_emits_linked_apm_only_spans(monkeypatch) -> None:
 
     class FakeAgent:
         async def astream_events(self, payload, *, config, version):
-            # Stands in for the instrumentor: nested spans must stay muted.
+            # Stands in for the retriever/LLM spans: they must reach APM now.
             with otel.trace.get_tracer("inner").start_as_current_span("inner"):
                 pass
             yield {
@@ -151,7 +151,7 @@ def test_native_turn_emits_linked_apm_only_spans(monkeypatch) -> None:
     async def passthrough(text):
         return text
 
-    async def no_output_control(answer, req, **kwargs):
+    async def no_output_control(answer, req):
         return answer, None
 
     fake_logger = FakeLogger()
@@ -168,10 +168,12 @@ def test_native_turn_emits_linked_apm_only_spans(monkeypatch) -> None:
     )
 
     spans = {span.name: span for span in exporter.get_finished_spans()}
-    assert set(spans) == {"POST /chat", "invoke_agent Agent Chat"}
+    assert set(spans) == {"POST /chat", "invoke_agent Agent Chat", "inner"}
     assert all(s.attributes[otel.APM_ONLY_ATTR] is True for s in spans.values())
     turn = spans["invoke_agent Agent Chat"]
-    assert turn.attributes["galileo.trace_id"] == "galileo-trace-1"
+    assert spans["inner"].context.trace_id == turn.context.trace_id
+    assert fake_logger.trace.id.int == turn.context.trace_id
+    assert turn.attributes["galileo.trace_id"] == str(fake_logger.trace.id)
     assert turn.attributes["output.value"] == "hi"
     assert fake_logger.metadata == {
         "otel_trace_id": format(turn.context.trace_id, "032x")

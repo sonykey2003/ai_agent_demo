@@ -24,13 +24,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Span as SdkSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
-from opentelemetry.sdk.trace.sampling import (
-    ALWAYS_ON,
-    Decision,
-    ParentBased,
-    Sampler,
-    SamplingResult,
-)
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
 from opentelemetry.trace import Span, SpanKind
 
 from opentelemetry._logs import set_logger_provider
@@ -83,35 +77,25 @@ def active_domain_scope(name: str | None) -> Generator[None]:
         active_domain.reset(token)
 
 
-# Set for turns the native Galileo logger owns end to end. OTel's
-# suppress-instrumentation context key is only honoured by OTel-native
-# instrumentors, so OpenLLMetry's LangChain handler and this app's own manual
-# spans still emit and surface as a second, half-empty trace next to the native
-# one. Dropping at the sampler stops every span regardless of who created it.
-otel_muted: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "otel_muted", default=False
+# Spans carrying this attribute are for Splunk APM only. The Collector's routing
+# connector drops them before the LLM-observability exporters (Galileo/Langfuse).
+# Used for turns whose Galileo trace is owned by the native GalileoLogger: APM
+# still gets the full span tree (DB, LLM, tools) without a second Galileo trace.
+APM_ONLY_ATTR = "telemetry.apm_only"
+
+apm_only: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "apm_only", default=False
 )
 
 
 @contextmanager
-def mute_otel_scope() -> Generator[None]:
-    """Drop every OTel span created within this scope."""
-    token = otel_muted.set(True)
+def apm_only_scope() -> Generator[None]:
+    """Mark every span created within this scope as APM-only."""
+    token = apm_only.set(True)
     try:
         yield
     finally:
-        otel_muted.reset(token)
-
-
-# Spans carrying this attribute are for Splunk APM only. The Collector's routing
-# connector drops them before the LLM-observability exporters (Galileo/Langfuse),
-# e.g. for turns whose Galileo trace is owned by the native GalileoLogger.
-APM_ONLY_ATTR = "telemetry.apm_only"
-
-
-def mark_apm_only(span: Span) -> None:
-    """Keep this span out of the LLM-observability backends (APM still gets it)."""
-    span.set_attribute(APM_ONLY_ATTR, True)
+        apm_only.reset(token)
 
 
 class UuidV4TraceIdGenerator(RandomIdGenerator):
@@ -126,35 +110,22 @@ class UuidV4TraceIdGenerator(RandomIdGenerator):
         return uuid.uuid4().int
 
 
-class _MutableSampler(Sampler):
-    """Delegating sampler that drops spans while ``otel_muted`` is set."""
-
-    def __init__(self, delegate: Sampler) -> None:
-        self._delegate = delegate
-
-    def should_sample(self, *args, **kwargs) -> SamplingResult:  # noqa: D102
-        if otel_muted.get():
-            return SamplingResult(Decision.DROP)
-        return self._delegate.should_sample(*args, **kwargs)
-
-    def get_description(self) -> str:  # noqa: D102
-        return f"MutableSampler({self._delegate.get_description()})"
-
-
 class _DomainStampingSpanProcessor(SpanProcessor):
-    """Stamp the routing attribute on every span at start.
+    """Stamp the routing attributes on every span at start.
 
     ``domain.name`` is set on the root turn span directly, but child spans
     (LLM, tool, retriever, LangGraph) are created by the instrumentor and would
-    otherwise lack it. Stamping at ``on_start`` from the per-request contextvar
-    puts it on all spans, so the Collector can route the whole trace to one
-    per-domain Galileo log stream.
+    otherwise lack it. Stamping at ``on_start`` from the per-request contextvars
+    puts it (and ``telemetry.apm_only``) on all spans, so the Collector routes
+    the whole trace consistently.
     """
 
     def on_start(self, span: SdkSpan, parent_context: Context | None = None) -> None:
         domain = active_domain.get()
         if domain:
             span.set_attribute("domain.name", domain)
+        if apm_only.get():
+            span.set_attribute(APM_ONLY_ATTR, True)
 
     def on_end(self, span: SdkSpan) -> None:  # noqa: D102
         pass
@@ -274,7 +245,7 @@ def setup_telemetry(app=None) -> TracerProvider | None:
     )
     provider = TracerProvider(
         resource=resource,
-        sampler=_MutableSampler(ParentBased(ALWAYS_ON)),
+        sampler=ParentBased(ALWAYS_ON),
         id_generator=UuidV4TraceIdGenerator(),
     )
     endpoint = settings.otel_exporter_otlp_endpoint.rstrip("/") + "/v1/traces"

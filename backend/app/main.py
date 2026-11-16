@@ -14,14 +14,12 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from opentelemetry import context as otel_context
-from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY
 from opentelemetry.trace import Span, Status, StatusCode
 from pydantic import BaseModel, Field
 
@@ -48,8 +46,7 @@ from .rag.ingest import ingest_all
 from .telemetry.otel import (
     active_domain_scope,
     active_genai_system_scope,
-    mark_apm_only,
-    mute_otel_scope,
+    apm_only_scope,
     set_guardrail_result,
     set_turn_input,
     set_turn_output,
@@ -267,7 +264,7 @@ _STEER_REVISION_PROMPT = (
 
 
 async def _revise_for_steer(
-    answer: str, guidance: str, req: ChatRequest, *, suppress_otel: bool
+    answer: str, guidance: str, req: ChatRequest
 ) -> str | None:
     """Rewrite `answer` per a steer control's steering context, then re-check it.
 
@@ -277,23 +274,12 @@ async def _revise_for_steer(
     if not guidance:
         return None
     model = make_chat_model(provider=req.provider, temperature=req.temperature)
-    token = (
-        otel_context.attach(
-            otel_context.set_value(_SUPPRESS_INSTRUMENTATION_KEY, True)
-        )
-        if suppress_otel
-        else None
+    result = await model.ainvoke(
+        [
+            ("system", _STEER_REVISION_PROMPT.format(guidance=guidance)),
+            ("user", answer),
+        ]
     )
-    try:
-        result = await model.ainvoke(
-            [
-                ("system", _STEER_REVISION_PROMPT.format(guidance=guidance)),
-                ("user", answer),
-            ]
-        )
-    finally:
-        if token is not None:
-            otel_context.detach(token)
     revised = _chunk_text(result).strip()
     if not revised:
         return None
@@ -305,7 +291,7 @@ async def _revise_for_steer(
 
 
 async def _resolve_output_control(
-    answer: str, req: ChatRequest, *, suppress_otel: bool = False
+    answer: str, req: ChatRequest
 ) -> tuple[str, dict | None]:
     """Apply the output-side control: steer revises the answer, deny withholds it.
 
@@ -317,9 +303,7 @@ async def _resolve_output_control(
         return answer, None
     except ControlSteerError as exc:
         info = describe_control_error(exc)
-        revised = await _revise_for_steer(
-            answer, info["detail"], req, suppress_otel=suppress_otel
-        )
+        revised = await _revise_for_steer(answer, info["detail"], req)
         info["revised"] = revised is not None
         if revised is not None:
             return revised, info
@@ -371,25 +355,29 @@ async def _agent_control_stream(
 
     The logger sets the trace input/output explicitly and enable_agent_control()
     bridges the @control span into the same trace, so input, the control decision,
-    and output all render. Nested OTel is muted so the logger owns one clean
-    trace; ``apm_span`` is the APM-only OTel turn span the two traces are
-    cross-linked through.
+    and output all render. The caller runs this inside apm_only_scope(), so the
+    OTel spans of the turn reach Splunk APM but not Galileo, and the logger owns
+    the one Galileo trace. ``apm_span`` is the OTel turn span.
     """
     logger = get_ac_logger()
     yield _sse(
         {"type": "meta", "domain": domain.name, "collection": domain.collection}
     )
 
-    # The native logger always mints its own trace ID, so link the two traces
-    # through metadata: otel_trace_id is the ID Splunk APM shows.
-    otel_trace_id = (
-        format(apm_span.get_span_context().trace_id, "032x") if apm_span else None
-    )
+    otel_trace_id = apm_span.get_span_context().trace_id if apm_span else None
     trace = logger.start_trace(
         input=req.message,
         name="Agent Chat",
-        metadata={"otel_trace_id": otel_trace_id} if otel_trace_id else None,
+        metadata=(
+            {"otel_trace_id": format(otel_trace_id, "032x")} if otel_trace_id else None
+        ),
     )
+    # start_trace always mints a random ID. In batch mode nothing is sent until
+    # flush(), so adopting the (UUIDv4-compliant) OTel trace ID here makes the
+    # Galileo and Splunk APM trace IDs identical. Distributed mode streams the
+    # trace immediately, so it keeps its own ID and relies on the metadata link.
+    if otel_trace_id and getattr(logger, "mode", None) == "batch":
+        trace.id = UUID(int=otel_trace_id)
     galileo_trace_id = getattr(trace, "id", None)
     if apm_span is not None and galileo_trace_id:
         apm_span.set_attribute("galileo.trace_id", str(galileo_trace_id))
@@ -426,68 +414,61 @@ async def _agent_control_stream(
             agent = build_agent(
                 provider=req.provider, temperature=req.temperature, domain=domain.name
             )
-            # Only the native logger traces this turn; silence the OTel instrumentor.
-            suppress = otel_context.attach(
-                otel_context.set_value(_SUPPRESS_INSTRUMENTATION_KEY, True)
-            )
-            try:
-                # Spans are logged as each step ENDS, interleaved with the control
-                # spans the Agent Control bridge writes live, so the trace reads in
-                # execution order: retrieve -> llm -> control -> tool -> llm.
-                async for event in agent.astream_events(
-                    {"messages": [("user", req.message)]},
-                    config={"configurable": {"thread_id": req.conversation_id}},
-                    version="v2",
-                ):
-                    kind = event.get("event")
-                    run_id = event.get("run_id")
-                    name = event.get("name", "")
-                    if kind == "on_chain_start" and name == "retrieve_context":
-                        pending_retrieval[run_id] = time.time_ns()
-                    elif kind == "on_chain_end" and name == "retrieve_context":
-                        started = pending_retrieval.pop(run_id, None)
-                        out = event.get("data", {}).get("output") or {}
-                        _log_retriever_span(logger, out, domain, req.message, started)
-                    elif kind == "on_chat_model_start":
-                        pending_llm[run_id] = (
-                            _llm_messages(
-                                event.get("data", {}).get("input", {}).get("messages")
-                            ),
-                            time.time_ns(),
-                        )
-                    elif kind == "on_chat_model_stream":
-                        token = _chunk_text(event["data"]["chunk"])
-                        if token:
-                            collected.append(token)
-                            yield _sse({"type": "token", "text": token})
-                    elif kind == "on_chat_model_end":
-                        msgs, started = pending_llm.pop(run_id, (None, None))
-                        _log_llm_span(
+            # Spans are logged as each step ENDS, interleaved with the control
+            # spans the Agent Control bridge writes live, so the trace reads in
+            # execution order: retrieve -> llm -> control -> tool -> llm.
+            async for event in agent.astream_events(
+                {"messages": [("user", req.message)]},
+                config={"configurable": {"thread_id": req.conversation_id}},
+                version="v2",
+            ):
+                kind = event.get("event")
+                run_id = event.get("run_id")
+                name = event.get("name", "")
+                if kind == "on_chain_start" and name == "retrieve_context":
+                    pending_retrieval[run_id] = time.time_ns()
+                elif kind == "on_chain_end" and name == "retrieve_context":
+                    started = pending_retrieval.pop(run_id, None)
+                    out = event.get("data", {}).get("output") or {}
+                    _log_retriever_span(logger, out, domain, req.message, started)
+                elif kind == "on_chat_model_start":
+                    pending_llm[run_id] = (
+                        _llm_messages(
+                            event.get("data", {}).get("input", {}).get("messages")
+                        ),
+                        time.time_ns(),
+                    )
+                elif kind == "on_chat_model_stream":
+                    token = _chunk_text(event["data"]["chunk"])
+                    if token:
+                        collected.append(token)
+                        yield _sse({"type": "token", "text": token})
+                elif kind == "on_chat_model_end":
+                    msgs, started = pending_llm.pop(run_id, (None, None))
+                    _log_llm_span(
+                        logger,
+                        msgs or req.message,
+                        event.get("data", {}).get("output"),
+                        cfg.model,
+                        started,
+                        assistant_node_name(domain.name),
+                    )
+                elif kind == "on_tool_start":
+                    tin = event.get("data", {}).get("input")
+                    pending_tools[run_id] = (name or "tool", tin, time.time_ns())
+                    yield _sse({"type": "tool", "name": name, "input": tin})
+                elif kind == "on_tool_end":
+                    tname, tin, started = pending_tools.pop(
+                        run_id, (None, None, None)
+                    )
+                    if tname:
+                        _log_tool_span(
                             logger,
-                            msgs or req.message,
+                            tname,
+                            tin,
                             event.get("data", {}).get("output"),
-                            cfg.model,
                             started,
-                            assistant_node_name(domain.name),
                         )
-                    elif kind == "on_tool_start":
-                        tin = event.get("data", {}).get("input")
-                        pending_tools[run_id] = (name or "tool", tin, time.time_ns())
-                        yield _sse({"type": "tool", "name": name, "input": tin})
-                    elif kind == "on_tool_end":
-                        tname, tin, started = pending_tools.pop(
-                            run_id, (None, None, None)
-                        )
-                        if tname:
-                            _log_tool_span(
-                                logger,
-                                tname,
-                                tin,
-                                event.get("data", {}).get("output"),
-                                started,
-                            )
-            finally:
-                otel_context.detach(suppress)
 
         answer = "".join(collected)
         displayed_answer = answer
@@ -499,7 +480,7 @@ async def _agent_control_stream(
             control_info: dict | None = None
             try:
                 displayed_answer, control_info = await _resolve_output_control(
-                    answer, req, suppress_otel=True
+                    answer, req
                 )
             except Exception:  # noqa: BLE001
                 log.exception("Agent Control output check failed; showing answer as-is.")
@@ -574,26 +555,24 @@ async def _event_stream(req: ChatRequest):
         and not otel_sink_active()
         and domain.name in settings.native_domains()
     ):
-        # The native logger owns this turn's Galileo trace. APM still gets the
-        # entry + turn spans (marked APM-only so the Collector keeps them out of
-        # Galileo/Langfuse); everything nested is muted so no second, LLM-less
-        # "invoke_agent LangGraph" trace lands beside the native one.
-        with active_domain_scope(domain.name), start_server_span(
+        # The native logger owns this turn's Galileo trace. Every OTel span of the
+        # turn (entry, retrieval/DB, LLM, tools) is marked APM-only, so Splunk APM
+        # gets the full tree while the Collector keeps it out of Galileo/Langfuse.
+        with active_genai_system_scope(cfg.genai_system), active_domain_scope(
+            domain.name
+        ), apm_only_scope(), start_server_span(
             method="POST", route="/chat"
-        ) as http_span, start_chat_span(
+        ), start_chat_span(
             conversation_id=req.conversation_id,
             provider_name=cfg.genai_system,
             model=cfg.model,
             input_text=req.message,
         ) as turn_span:
-            mark_apm_only(http_span)
-            mark_apm_only(turn_span)
             turn_span.set_attribute("domain.name", domain.name)
-            with mute_otel_scope():
-                async for chunk in _agent_control_stream(
-                    req, cfg, domain, apm_span=turn_span
-                ):
-                    yield chunk
+            async for chunk in _agent_control_stream(
+                req, cfg, domain, apm_span=turn_span
+            ):
+                yield chunk
         return
 
     # The scope remains active for the full generator lifetime, so all nested
