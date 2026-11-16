@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from types import SimpleNamespace
 
 from opentelemetry.sdk.trace import TracerProvider
@@ -7,6 +8,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
 from app import main
 from app.config import Settings
@@ -103,3 +105,75 @@ def test_stream_passes_thread_id_and_leaves_output_raw(monkeypatch) -> None:
     assert not [e for e in events if e["type"] == "redacted"]
     assert {"type": "token", "text": "jane@example.com"} in events
     assert events[-1] == {"type": "done"}
+
+def test_trace_ids_survive_galileo_uuidv4_normalization() -> None:
+    generator = otel.UuidV4TraceIdGenerator()
+    for _ in range(500):
+        trace_id = generator.generate_trace_id()
+        # Galileo stores uuid.UUID(int=trace_id, version=4); it must be a no-op.
+        assert uuid.UUID(int=trace_id, version=4).int == trace_id
+
+
+def test_native_turn_emits_linked_apm_only_spans(monkeypatch) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(
+        sampler=otel._MutableSampler(ALWAYS_ON),
+        id_generator=otel.UuidV4TraceIdGenerator(),
+    )
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(
+        otel.trace, "get_tracer", lambda name, *a, **k: provider.get_tracer(name)
+    )
+
+    class FakeLogger:
+        metadata = None
+
+        def start_trace(self, *, input, name, metadata=None):
+            self.metadata = metadata
+            return SimpleNamespace(id="galileo-trace-1")
+
+        def conclude(self, output):
+            pass
+
+        def flush(self):
+            pass
+
+    class FakeAgent:
+        async def astream_events(self, payload, *, config, version):
+            # Stands in for the instrumentor: nested spans must stay muted.
+            with otel.trace.get_tracer("inner").start_as_current_span("inner"):
+                pass
+            yield {
+                "event": "on_chat_model_stream",
+                "data": {"chunk": SimpleNamespace(content="hi")},
+            }
+
+    async def passthrough(text):
+        return text
+
+    async def no_output_control(answer, req, **kwargs):
+        return answer, None
+
+    fake_logger = FakeLogger()
+    monkeypatch.setattr(main, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(main, "agent_control_active", lambda: True)
+    monkeypatch.setattr(main, "otel_sink_active", lambda: False)
+    monkeypatch.setattr(main, "get_ac_logger", lambda: fake_logger)
+    monkeypatch.setattr(main, "evaluate_user_input", passthrough)
+    monkeypatch.setattr(main, "_resolve_output_control", no_output_control)
+    monkeypatch.setattr(main, "build_agent", lambda **kwargs: FakeAgent())
+
+    asyncio.run(
+        _events(ChatRequest(message="hello", provider="local", domain="bank"))
+    )
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert set(spans) == {"POST /chat", "invoke_agent Agent Chat"}
+    assert all(s.attributes[otel.APM_ONLY_ATTR] is True for s in spans.values())
+    turn = spans["invoke_agent Agent Chat"]
+    assert turn.attributes["galileo.trace_id"] == "galileo-trace-1"
+    assert turn.attributes["output.value"] == "hi"
+    assert fake_logger.metadata == {
+        "otel_trace_id": format(turn.context.trace_id, "032x")
+    }
+    provider.shutdown()

@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from opentelemetry import context as otel_context
 from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry.trace import Span, Status, StatusCode
 from pydantic import BaseModel, Field
 
 from .agent.graph import assistant_node_name, build_agent
@@ -48,6 +48,7 @@ from .rag.ingest import ingest_all
 from .telemetry.otel import (
     active_domain_scope,
     active_genai_system_scope,
+    mark_apm_only,
     mute_otel_scope,
     set_guardrail_result,
     set_turn_input,
@@ -105,7 +106,17 @@ async def lifespan(_app: FastAPI):
         shutdown_telemetry()
 
 
-app = FastAPI(title="Vendor-Agnostic AI Agent Chat Demo", lifespan=lifespan)
+# FastAPI >=0.142 otherwise claims the global OTel providers before lifespan runs setup_telemetry().
+app = FastAPI(
+    title="Vendor-Agnostic AI Agent Chat Demo",
+    lifespan=lifespan,
+    telemetry={
+        "auto_configure": False,
+        "tracing": False,
+        "metrics": False,
+        "logs": False,
+    },
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -346,19 +357,42 @@ def domains() -> dict:
     }
 
 
-async def _agent_control_stream(req: ChatRequest, cfg, domain):
+def _record_apm_outcome(span: Span | None, output: str, result: str) -> None:
+    if span is None:
+        return
+    set_turn_output(span, output)
+    span.set_attribute("agent.result", result)
+
+
+async def _agent_control_stream(
+    req: ChatRequest, cfg, domain, apm_span: Span | None = None
+):
     """Agent Control turn traced by the native Galileo logger (reference pattern).
 
     The logger sets the trace input/output explicitly and enable_agent_control()
     bridges the @control span into the same trace, so input, the control decision,
-    and output all render. OTel is suppressed so the logger owns one clean trace.
+    and output all render. Nested OTel is muted so the logger owns one clean
+    trace; ``apm_span`` is the APM-only OTel turn span the two traces are
+    cross-linked through.
     """
     logger = get_ac_logger()
     yield _sse(
         {"type": "meta", "domain": domain.name, "collection": domain.collection}
     )
 
-    logger.start_trace(input=req.message, name="Agent Chat")
+    # The native logger always mints its own trace ID, so link the two traces
+    # through metadata: otel_trace_id is the ID Splunk APM shows.
+    otel_trace_id = (
+        format(apm_span.get_span_context().trace_id, "032x") if apm_span else None
+    )
+    trace = logger.start_trace(
+        input=req.message,
+        name="Agent Chat",
+        metadata={"otel_trace_id": otel_trace_id} if otel_trace_id else None,
+    )
+    galileo_trace_id = getattr(trace, "id", None)
+    if apm_span is not None and galileo_trace_id:
+        apm_span.set_attribute("galileo.trace_id", str(galileo_trace_id))
     concluded = False
     try:
         # Enforcement is the @control decorator: a deny/steer raises here.
@@ -369,6 +403,7 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
             reason = info["reason"]
             logger.conclude(output=reason)
             concluded = True
+            _record_apm_outcome(apm_span, reason, "blocked_by_agent_control")
             yield _sse(
                 {
                     "type": "guardrail",
@@ -493,8 +528,13 @@ async def _agent_control_stream(req: ChatRequest, cfg, domain):
 
         logger.conclude(output=displayed_answer)
         concluded = True
+        _record_apm_outcome(apm_span, displayed_answer, "completed")
     except Exception as exc:  # noqa: BLE001
         log.exception("agent error")
+        if apm_span is not None:
+            apm_span.record_exception(exc)
+            apm_span.set_attribute("error.type", type(exc).__name__)
+            apm_span.set_status(Status(StatusCode.ERROR, str(exc)))
         if not concluded:
             try:
                 logger.conclude(output=f"error: {exc}")
@@ -534,11 +574,26 @@ async def _event_stream(req: ChatRequest):
         and not otel_sink_active()
         and domain.name in settings.native_domains()
     ):
-        # The native logger owns this turn's trace; muting OTel stops a second,
-        # LLM-less "invoke_agent LangGraph" trace landing beside it.
-        with mute_otel_scope(), active_domain_scope(domain.name):
-            async for chunk in _agent_control_stream(req, cfg, domain):
-                yield chunk
+        # The native logger owns this turn's Galileo trace. APM still gets the
+        # entry + turn spans (marked APM-only so the Collector keeps them out of
+        # Galileo/Langfuse); everything nested is muted so no second, LLM-less
+        # "invoke_agent LangGraph" trace lands beside the native one.
+        with active_domain_scope(domain.name), start_server_span(
+            method="POST", route="/chat"
+        ) as http_span, start_chat_span(
+            conversation_id=req.conversation_id,
+            provider_name=cfg.genai_system,
+            model=cfg.model,
+            input_text=req.message,
+        ) as turn_span:
+            mark_apm_only(http_span)
+            mark_apm_only(turn_span)
+            turn_span.set_attribute("domain.name", domain.name)
+            with mute_otel_scope():
+                async for chunk in _agent_control_stream(
+                    req, cfg, domain, apm_span=turn_span
+                ):
+                    yield chunk
         return
 
     # The scope remains active for the full generator lifetime, so all nested

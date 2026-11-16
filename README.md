@@ -156,6 +156,27 @@ every turn. The backend records it as `gen_ai.conversation.id` and `session.id`,
 so separate turn traces can be grouped into one conversation. Non-browser API
 clients may omit it and receive a generated ID per request.
 
+### Trace ID correlation (Galileo ↔ Splunk APM)
+
+The Collector sends every OTel trace to Galileo and Splunk APM with the same
+128-bit trace ID. Galileo normalizes ingested IDs to UUIDv4, so the app generates
+trace IDs that are already UUIDv4 (`UuidV4TraceIdGenerator` in
+`telemetry/otel.py`); the normalization is then a no-op and the IDs match:
+
+```
+Galileo trace ID : 45de319b-7942-4201-b365-e8e5a347eaeb
+Splunk APM ID    : 45de319b79424201b365e8e5a347eaeb   (same, without dashes)
+```
+
+Turns on the native Galileo path (Agent Control native domains, `bank` by
+default) are different: the Galileo logger always mints its own trace ID. Those
+turns still emit the `POST /chat` and `invoke_agent Agent Chat` spans for APM,
+marked `telemetry.apm_only=true` so the Collector keeps them out of
+Galileo/Langfuse, and the two traces are cross-linked instead:
+
+- Galileo trace metadata `otel_trace_id` = the Splunk APM trace ID.
+- APM span attribute `galileo.trace_id` = the Galileo trace ID.
+
 FastAPI auto-instrumentation is intentionally disabled, and the manual SERVER
 span replaces it. The agent executes in an SSE response generator after a
 conventional HTTP server span would close, so auto-instrumentation produces a
@@ -169,8 +190,9 @@ record carries the same resource (`service.name`, `deployment.environment`) plus
 the active `trace_id` and `span_id` — which is what makes logs correlate with
 traces. Container stdout alone would not.
 
-Turns handled by the native Galileo path (see Agent Control) drop their spans at
-the sampler, so logs from those turns carry a zero trace ID.
+Turns handled by the native Galileo path (see Agent Control) mute their nested
+spans at the sampler; their logs carry the trace ID of the APM-only turn span,
+so they still correlate with the Splunk APM trace.
 
 ## Privacy boundary
 
@@ -277,8 +299,10 @@ recreating the Collector.
 `otel-collector.apm-dbmon.yaml` is merged into every Collector start and adds
 three Splunk destinations. Its credentials come from the shared Splunk
 environment file, which `scripts/up.sh` sources; export `SPLUNK_REALM`,
-`SPLUNK_ACCESS_TOKEN` and `SPLUNK_LOCAL_HEC` before running Compose directly, or
-the Collector fails to start on an empty realm.
+`SPLUNK_ACCESS_TOKEN` and `SPLUNK_LOCAL_HEC` (or set them in `.env`, see
+`.env.example`) before running Compose directly — including
+`docker compose up -d --force-recreate otel-collector` — or the Collector is
+recreated with empty Splunk credentials.
 
 - **APM traces** — the `traces/in` pipeline fans out to the routing connector
   (Galileo/Langfuse) *and* to Splunk O11y. Because each trace is rooted at a
@@ -316,9 +340,9 @@ ITERATIONS=20 DELAY=5 ./scripts/loadgen.sh
 DOMAINS="healthcare insurance" ./scripts/loadgen.sh
 ```
 
-Bank is excluded by default: that domain runs the native Galileo path with OTel
-muted, so it emits no spans. Override with `DOMAINS="bank"` if you want its
-database activity without traces.
+Bank is excluded by default: that domain runs the native Galileo path, so it
+emits only the APM-only entry/turn spans over OTLP (its Galileo trace comes from
+the native logger). Override with `DOMAINS="bank"` to include it.
 
 ## Agent Control (optional runtime guardrail)
 

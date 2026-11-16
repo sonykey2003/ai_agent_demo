@@ -8,6 +8,9 @@ ollama_log="${TMPDIR:-/tmp}/ai-agent-demo-ollama.log"
 # Load environment variables from the Splunk .env file for APM & DBmon instrumentation
 splunk_env="/Users/shawsong/repo/demoAppsTemplate/splunk/.env"
 [ -f "$splunk_env" ] && source "$splunk_env"
+if [ -z "${SPLUNK_REALM:-}" ] || [ -z "${SPLUNK_ACCESS_TOKEN:-}" ]; then
+    echo >&2 "Warning: SPLUNK_REALM/SPLUNK_ACCESS_TOKEN not set; Splunk APM/DBMon export will fail."
+fi
 
 
 ollama_ready() {

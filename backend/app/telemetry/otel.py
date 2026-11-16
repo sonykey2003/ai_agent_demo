@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 
@@ -22,6 +23,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Span as SdkSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
 from opentelemetry.sdk.trace.sampling import (
     ALWAYS_ON,
     Decision,
@@ -99,6 +101,29 @@ def mute_otel_scope() -> Generator[None]:
         yield
     finally:
         otel_muted.reset(token)
+
+
+# Spans carrying this attribute are for Splunk APM only. The Collector's routing
+# connector drops them before the LLM-observability exporters (Galileo/Langfuse),
+# e.g. for turns whose Galileo trace is owned by the native GalileoLogger.
+APM_ONLY_ATTR = "telemetry.apm_only"
+
+
+def mark_apm_only(span: Span) -> None:
+    """Keep this span out of the LLM-observability backends (APM still gets it)."""
+    span.set_attribute(APM_ONLY_ATTR, True)
+
+
+class UuidV4TraceIdGenerator(RandomIdGenerator):
+    """Trace IDs that are already valid UUIDv4 values.
+
+    Galileo normalizes ingested OTel trace IDs to UUIDv4 (forcing the version and
+    variant bits). Emitting compliant IDs makes that normalization a no-op, so
+    the Galileo trace ID minus dashes equals the Splunk APM trace ID.
+    """
+
+    def generate_trace_id(self) -> int:  # noqa: D102
+        return uuid.uuid4().int
 
 
 class _MutableSampler(Sampler):
@@ -248,7 +273,9 @@ def setup_telemetry(app=None) -> TracerProvider | None:
         }
     )
     provider = TracerProvider(
-        resource=resource, sampler=_MutableSampler(ParentBased(ALWAYS_ON))
+        resource=resource,
+        sampler=_MutableSampler(ParentBased(ALWAYS_ON)),
+        id_generator=UuidV4TraceIdGenerator(),
     )
     endpoint = settings.otel_exporter_otlp_endpoint.rstrip("/") + "/v1/traces"
     exporter = OTLPSpanExporter(endpoint=endpoint)

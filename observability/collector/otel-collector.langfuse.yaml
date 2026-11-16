@@ -84,6 +84,10 @@ exporters:
     tls:
       insecure_skip_verify: true
 
+  # Sink for APM-only spans (telemetry.apm_only=true): discarded here; the
+  # Splunk APM exporter on traces/in still receives them.
+  nop/apm_only: {}
+
 connectors:
   # Routes each span to a per-domain Langfuse pipeline by the domain.name span
   # attribute the app stamps on every span. Spans without domain.name fall to the
@@ -94,6 +98,11 @@ connectors:
     error_mode: ignore
     default_pipelines: [traces/langfuse_default]
     table:
+      # Must stay first: the first matching route wins, so APM-only spans never
+      # reach Langfuse.
+      - context: span
+        condition: attributes["telemetry.apm_only"] == true
+        pipelines: [traces/apm_only]
       - context: span
         condition: attributes["domain.name"] == "bank"
         pipelines: [traces/langfuse_bank]
@@ -135,3 +144,6 @@ service:
     traces/langfuse_default:
       receivers: [routing]
       exporters: [otlp_http/langfuse_default]
+    traces/apm_only:
+      receivers: [routing]
+      exporters: [nop/apm_only]

@@ -16,6 +16,14 @@ data:
             endpoint: 0.0.0.0:4317
     processors:
       batch: {}
+      # APM-only spans (telemetry.apm_only=true) are kept out of Galileo; the
+      # native Galileo logger owns those turns. Add an APM exporter in a separate
+      # pipeline without this processor if you need them in Splunk.
+      filter/apm_only:
+        error_mode: ignore
+        traces:
+          span:
+            - attributes["telemetry.apm_only"] == true
     exporters:
       otlp_http/galileo:
         traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
@@ -27,7 +35,7 @@ data:
       pipelines:
         traces:
           receivers: [otlp]
-          processors: [batch]
+          processors: [filter/apm_only, batch]
           exporters: [otlp_http/galileo]
 ---
 apiVersion: apps/v1
