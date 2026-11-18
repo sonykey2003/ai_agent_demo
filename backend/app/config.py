@@ -31,6 +31,9 @@ class ProviderConfig(BaseModel):
     # set per provider (0 for the hosted ones).
     max_tokens: int
     frequency_penalty: float
+    # Whether the model accepts image input. None = ask the endpoint (Ollama
+    # reports a "vision" capability per model).
+    supports_vision: bool | None = False
 
 
 class Settings(BaseSettings):
@@ -59,6 +62,38 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434/v1"
     local_model: str = "qwen2.5:0.5b"
 
+    # --- Image input capability per provider ---
+    openai_supports_vision: bool = True
+    openrouter_supports_vision: bool = False
+    # Unset = detect from Ollama's model capabilities (e.g. gemma4 has "vision").
+    local_supports_vision: bool | None = None
+
+    # --- Chat attachments (files & pictures) ---
+    attachment_max_mb: int = 50
+    attachment_max_files: int = 4
+    attachment_max_per_conversation: int = 20
+    attachment_max_pdf_pages: int = 300
+    # Long edge of the image copy sent to vision models.
+    attachment_image_max_px: int = 1568
+    # Decompression-bomb guard for uploaded images.
+    attachment_image_max_pixels: int = 80_000_000
+    attachment_image_detail: str = "auto"
+    # Images from this many recent turns are re-sent so follow-ups still see them.
+    attachment_image_carryover_turns: int = 2
+    # Attachment text placed in the prompt; smaller for the local model's context.
+    attachment_inline_max_chars: int = 12_000
+    attachment_inline_max_chars_local: int = 4_000
+    # Extracted text kept per attachment (far above any prompt budget).
+    attachment_max_text_chars: int = 1_000_000
+    attachment_ttl_hours: float = 24.0
+    attachment_ocr_enabled: bool = True
+    # Long edge of the working copy OCR reads (larger than the model copy).
+    attachment_ocr_max_px: int = 3000
+    attachment_ocr_max_pages: int = 20
+    attachment_ocr_min_confidence: float = 0.5
+    attachment_ocr_timeout_s: float = 120.0
+    attachment_ocr_pdf_dpi: int = 200
+
     # --- Retrieval-augmented generation (PostgreSQL + pgvector) ---
     rag_enabled: bool = True
     postgres_url: str = (
@@ -80,6 +115,8 @@ class Settings(BaseSettings):
     otel_exporter_otlp_endpoint: str = "http://localhost:4318"
     otel_service_name: str = "agent-chat-demo"
     deployment_environment: str = "demo"
+    # false = replace base64 media in exported span attributes with a size/hash stub.
+    telemetry_inline_media: bool = False
 
     # --- Optional Galileo Agent Control (opt-in; native SDK, not OTel) ---
     agent_control_enabled: bool = False
@@ -127,6 +164,7 @@ class Settings(BaseSettings):
                 genai_system="openai",
                 max_tokens=self.max_tokens,
                 frequency_penalty=0.0,
+                supports_vision=self.openai_supports_vision,
             ),
             "openrouter": ProviderConfig(
                 name="openrouter",
@@ -138,6 +176,7 @@ class Settings(BaseSettings):
                 genai_system="openrouter",
                 max_tokens=self.max_tokens,
                 frequency_penalty=0.0,
+                supports_vision=self.openrouter_supports_vision,
             ),
             "local": ProviderConfig(
                 name="local",
@@ -149,6 +188,7 @@ class Settings(BaseSettings):
                 genai_system="ollama",
                 max_tokens=self.max_tokens,
                 frequency_penalty=self.frequency_penalty,
+                supports_vision=self.local_supports_vision,
             ),
         }
 

@@ -34,6 +34,7 @@ def test_lifespan_builds_rag_before_startup(monkeypatch) -> None:
         rag_collection="test_knowledge",
         rag_startup_attempts=1,
         rag_startup_retry_seconds=0,
+        attachment_ocr_enabled=False,
     )
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "setup_telemetry", lambda _app: calls.append("setup"))

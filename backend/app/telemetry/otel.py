@@ -11,8 +11,10 @@ the imports are best-effort so the app still runs in a bare environment.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
+import re
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -21,8 +23,14 @@ from opentelemetry import trace
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import Span as SdkSpan, SpanProcessor, TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace import (
+    Event,
+    ReadableSpan,
+    Span as SdkSpan,
+    SpanProcessor,
+    TracerProvider,
+)
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
 from opentelemetry.trace import Span, SpanKind
@@ -144,12 +152,122 @@ def _genai_message(role: str, content: str, finish_reason: str | None = None) ->
     return msg
 
 
-def set_turn_input(span: Span, text: str) -> None:
-    """Record the real user input on the turn root span."""
+def _attachment_part(attachment: dict) -> dict:
+    """GenAI semconv reference part; the media itself never goes into the span."""
+    if attachment.get("kind") == "image":
+        return {
+            "type": "uri",
+            "modality": "image",
+            "mime_type": attachment.get("mime_type"),
+            "uri": f"attachment://{attachment.get('id')}",
+        }
+    return {
+        "type": "file",
+        "modality": "document",
+        "mime_type": attachment.get("mime_type"),
+        "file_id": attachment.get("id"),
+    }
+
+
+def set_turn_input(span: Span, text: str, attachments: list[dict] | None = None) -> None:
+    """Record the real user input (plus attachment references) on the turn span."""
     span.set_attribute("input.value", text)
-    span.set_attribute(
-        "gen_ai.input.messages", json.dumps([_genai_message("user", text)])
-    )
+    message = _genai_message("user", text)
+    message["parts"].extend(_attachment_part(a) for a in attachments or [])
+    span.set_attribute("gen_ai.input.messages", json.dumps([message]))
+
+
+def set_turn_attachments(span: Span, attachments: list[dict], delivery: str) -> None:
+    span.set_attribute("attachment.count", len(attachments))
+    span.set_attribute("attachment.ids", [a["id"] for a in attachments])
+    span.set_attribute("attachment.kinds", [a["kind"] for a in attachments])
+    span.set_attribute("attachment.delivery", delivery)
+
+
+_DATA_URI_RE = re.compile(r"data:([\w.+-]+/[\w.+-]+);base64,([A-Za-z0-9+/=]+)")
+
+
+def scrub_media(value: str) -> str:
+    """Replace base64 data URIs with a size and hash stub."""
+    if ";base64," not in value:
+        return value
+
+    def stub(match: re.Match) -> str:
+        payload = match.group(2)
+        digest = hashlib.sha256(payload.encode()).hexdigest()[:12]
+        size = len(payload) * 3 // 4
+        return f"data:{match.group(1)};base64,<omitted {size} bytes sha256:{digest}>"
+
+    return _DATA_URI_RE.sub(stub, value)
+
+
+def _scrub_attributes(attributes) -> tuple[dict, bool]:
+    changed = False
+    out = {}
+    for key, value in (attributes or {}).items():
+        if isinstance(value, str):
+            new = scrub_media(value)
+        elif isinstance(value, (list, tuple)) and any(isinstance(v, str) for v in value):
+            new = type(value)(scrub_media(v) if isinstance(v, str) else v for v in value)
+        else:
+            new = value
+        changed = changed or new != value
+        out[key] = new
+    return out, changed
+
+
+class _ScrubbedSpan:
+    """Read-only view of a finished span with replaced attributes/events."""
+
+    def __init__(self, span: ReadableSpan, attributes: dict, events) -> None:
+        self._span = span
+        self._attributes = attributes
+        self._events = events
+
+    @property
+    def attributes(self):
+        return self._attributes
+
+    @property
+    def events(self):
+        return self._events
+
+    def __getattr__(self, name):
+        return getattr(self._span, name)
+
+
+class MediaScrubbingSpanExporter(SpanExporter):
+    """Keep base64 images out of exported spans.
+
+    OpenLLMetry records prompt content, so a vision turn would otherwise put
+    megabytes of data-URI image into the LLM span (and hit exporter/Collector/
+    backend size limits). This is payload hygiene, not PII redaction.
+    """
+
+    def __init__(self, exporter: SpanExporter) -> None:
+        self._exporter = exporter
+
+    def _scrub(self, span: ReadableSpan):
+        attributes, changed = _scrub_attributes(span.attributes)
+        events = []
+        for event in span.events:
+            event_attributes, event_changed = _scrub_attributes(event.attributes)
+            changed = changed or event_changed
+            events.append(
+                Event(event.name, attributes=event_attributes, timestamp=event.timestamp)
+                if event_changed
+                else event
+            )
+        return _ScrubbedSpan(span, attributes, tuple(events)) if changed else span
+
+    def export(self, spans):  # noqa: D102
+        return self._exporter.export([self._scrub(span) for span in spans])
+
+    def shutdown(self) -> None:  # noqa: D102
+        self._exporter.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:  # noqa: D102
+        return self._exporter.force_flush(timeout_millis)
 
 
 def set_turn_output(span: Span, text: str) -> None:
@@ -174,6 +292,7 @@ def start_chat_span(
     provider_name: str,
     model: str,
     input_text: str,
+    attachments: list[dict] | None = None,
 ) -> Generator[Span]:
     """Create the valid GenAI root span that owns one complete streamed turn."""
     tracer = trace.get_tracer("agent_chat.turn")
@@ -186,7 +305,7 @@ def start_chat_span(
         span.set_attribute("gen_ai.agent.name", "Agent Chat")
         span.set_attribute("gen_ai.conversation.id", conversation_id)
         span.set_attribute("session.id", conversation_id)
-        set_turn_input(span, input_text)
+        set_turn_input(span, input_text, attachments)
         yield span
 
 
@@ -250,6 +369,8 @@ def setup_telemetry(app=None) -> TracerProvider | None:
     )
     endpoint = settings.otel_exporter_otlp_endpoint.rstrip("/") + "/v1/traces"
     exporter = OTLPSpanExporter(endpoint=endpoint)
+    if not settings.telemetry_inline_media:
+        exporter = MediaScrubbingSpanExporter(exporter)
     # Runs before the exporter so every span carries domain.name for routing.
     provider.add_span_processor(_DomainStampingSpanProcessor())
     provider.add_span_processor(BatchSpanProcessor(exporter))

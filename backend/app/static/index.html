@@ -105,6 +105,47 @@
         display: flex; align-items: center; justify-content: center;
       }
       .send:disabled { opacity: 0.45; cursor: default; }
+
+      .attach {
+        width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border); cursor: pointer;
+        background: var(--panel); color: var(--text); font-size: 15px; line-height: 1;
+        display: flex; align-items: center; justify-content: center; flex: none;
+      }
+      .attach:hover { border-color: var(--accent); }
+      .composer.dragging { border-color: var(--accent); border-style: dashed; background: #17243a; }
+      .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 6px 0; }
+      .chips:empty { display: none; }
+      .chip {
+        position: relative; display: flex; align-items: center; gap: 8px; max-width: 260px;
+        background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+        padding: 6px 28px 6px 6px; overflow: hidden; font-size: 12px;
+      }
+      .chip.error { border-color: var(--error); }
+      .chip .thumb {
+        width: 40px; height: 40px; border-radius: 8px; object-fit: cover; flex: none;
+        background: var(--panel-2); display: flex; align-items: center; justify-content: center; font-size: 20px;
+      }
+      .chip .info { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+      .chip .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+      .chip .meta { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .chip.error .meta { color: #ff7b72; white-space: normal; }
+      .chip .badge { color: #f2cc60; }
+      .chip .remove {
+        position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border-radius: 50%;
+        border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1;
+      }
+      .chip .remove:hover { color: var(--text); background: var(--border); }
+      .chip .progress { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); transition: width 0.15s; }
+      .chip.processing .progress { width: 100% !important; animation: pulse 1.2s ease-in-out infinite; }
+      @keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+
+      .bubble .files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-bottom: 8px; }
+      .bubble .files:last-child { margin-bottom: 0; }
+      .bubble .files img { max-width: 180px; max-height: 140px; border-radius: 10px; display: block; }
+      .bubble .files .doc {
+        background: rgba(255, 255, 255, 0.15); border-radius: 8px; padding: 6px 10px; font-size: 13px;
+      }
+      .notice.file { color: #9ecbff; border-color: var(--accent); }
     </style>
   </head>
   <body>
@@ -116,13 +157,16 @@
         <div id="messages"></div>
         <div class="hero">
           <h1>Ready when you are.</h1>
-          <p>Ask the agent anything — choose a model below.</p>
+          <p>Ask the agent anything — choose a model below. Attach documents or pictures with 📎.</p>
         </div>
         <div class="composer-wrap">
           <form class="composer" id="composer" autocomplete="off">
-            <textarea id="input" rows="1" placeholder="Ask the agent…"></textarea>
+            <div class="chips" id="chips"></div>
+            <textarea id="input" rows="1" placeholder="Ask the agent… (attach files or images with 📎, drag-and-drop, or paste)"></textarea>
             <div class="composer-bar">
               <div class="controls">
+                <button class="attach" id="attach" type="button" title="Attach files or images">📎</button>
+                <input type="file" id="file-input" multiple hidden />
                 <label class="model">Model
                   <select id="provider"></select>
                 </label>
@@ -145,15 +189,179 @@
       const sendBtn = document.getElementById("send");
       const providerSel = document.getElementById("provider");
       const domainSel = document.getElementById("domain");
+      const chipsEl = document.getElementById("chips");
+      const fileInput = document.getElementById("file-input");
+      const attachBtn = document.getElementById("attach");
       const conversationId = crypto.randomUUID
         ? crypto.randomUUID()
         : `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      const visionByProvider = {};
+      let limits = { max_mb: 50, max_files: 4, accepted: { image: [], document: [] } };
+      let pending = [];
+      let busy = false;
+
+      const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"];
+      const isImageFile = (f) => IMAGE_TYPES.includes(f.type) || /\.(png|jpe?g|webp)$/i.test(f.name);
+      const selectedSeesImages = () => visionByProvider[providerSel.value] !== false;
+
+      function formatSize(bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
+        return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+      }
+
+      function readyMeta(d) {
+        const ocr = d.ocr;
+        if (d.kind === "image") {
+          if (!ocr) return "image";
+          return ocr.lines ? `🔤 ${ocr.lines} lines recognized` : "no text recognized";
+        }
+        const parts = [];
+        if (d.pages) parts.push(d.pages + (d.pages === 1 ? " page" : " pages"));
+        if (ocr && ocr.pages) parts.push(`${ocr.pages} OCR'd`);
+        parts.push(d.chars.toLocaleString() + " chars");
+        return parts.join(" · ");
+      }
+
+      function renderChips() {
+        chipsEl.innerHTML = "";
+        for (const item of pending) {
+          const chip = document.createElement("div");
+          chip.className = "chip " + item.status;
+          const thumb = item.previewUrl ? document.createElement("img") : document.createElement("div");
+          thumb.className = "thumb";
+          if (item.previewUrl) thumb.src = item.previewUrl;
+          else thumb.textContent = "📄";
+          const info = document.createElement("div");
+          info.className = "info";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = item.file.name;
+          name.title = item.file.name;
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          if (item.status === "uploading") meta.textContent = `uploading ${item.progress}% · ${formatSize(item.file.size)}`;
+          else if (item.status === "processing") meta.textContent = item.isImage || /\.pdf$/i.test(item.file.name) ? "recognizing text…" : "processing…";
+          else if (item.status === "error") meta.textContent = item.error;
+          else meta.textContent = readyMeta(item.descriptor);
+          if (item.isImage && item.status !== "error" && !selectedSeesImages()) {
+            const badge = document.createElement("span");
+            badge.className = "badge";
+            badge.textContent = " · 🔤 text only";
+            meta.appendChild(badge);
+            chip.title = "This model can't see images — it will get the recognized text.";
+          }
+          info.append(name, meta);
+          const remove = document.createElement("button");
+          remove.type = "button";
+          remove.className = "remove";
+          remove.textContent = "×";
+          remove.title = "Remove";
+          remove.addEventListener("click", () => removeItem(item));
+          chip.append(thumb, info, remove);
+          if (item.status === "uploading" || item.status === "processing") {
+            const bar = document.createElement("div");
+            bar.className = "progress";
+            bar.style.width = item.progress + "%";
+            chip.appendChild(bar);
+          }
+          chipsEl.appendChild(chip);
+        }
+        updateSend();
+      }
+
+      function updateSend() {
+        const inFlight = pending.some((i) => i.status === "uploading" || i.status === "processing");
+        const ready = pending.some((i) => i.status === "ready");
+        sendBtn.disabled = busy || inFlight || (!input.value.trim() && !ready);
+      }
+
+      function removeItem(item) {
+        if (item.xhr && item.status !== "ready") item.xhr.abort();
+        if (item.status === "ready") {
+          fetch(`/attachments/${item.descriptor.id}?conversation_id=${encodeURIComponent(conversationId)}`, { method: "DELETE" }).catch(() => {});
+        }
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+        pending = pending.filter((i) => i !== item);
+        renderChips();
+      }
+
+      function addFiles(files) {
+        for (const file of files) {
+          const active = pending.filter((i) => i.status !== "error").length;
+          const item = { file, status: "uploading", progress: 0, isImage: isImageFile(file) };
+          if (item.isImage) item.previewUrl = URL.createObjectURL(file);
+          pending.push(item);
+          if (active >= limits.max_files) {
+            item.status = "error";
+            item.error = `Attach at most ${limits.max_files} files per message.`;
+          } else if (file.size > limits.max_mb * 1024 * 1024) {
+            item.status = "error";
+            item.error = `Larger than ${limits.max_mb} MB (${formatSize(file.size)}).`;
+          } else {
+            upload(item);
+          }
+        }
+        renderChips();
+      }
+
+      function upload(item) {
+        const form = new FormData();
+        form.append("conversation_id", conversationId);
+        form.append("file", item.file, item.file.name);
+        const xhr = new XMLHttpRequest();
+        item.xhr = xhr;
+        xhr.open("POST", "/attachments");
+        xhr.upload.onprogress = (e) => {
+          if (!e.lengthComputable) return;
+          item.progress = Math.round((e.loaded / e.total) * 100);
+          renderChips();
+        };
+        xhr.upload.onload = () => { item.status = "processing"; renderChips(); };
+        xhr.onload = () => {
+          let body = {};
+          try { body = JSON.parse(xhr.responseText); } catch {}
+          if (xhr.status === 200) { item.status = "ready"; item.descriptor = body; }
+          else { item.status = "error"; item.error = body.error || `Upload failed (${xhr.status}).`; }
+          renderChips();
+        };
+        xhr.onerror = () => { item.status = "error"; item.error = "Upload failed (network error)."; renderChips(); };
+        xhr.send(form);
+      }
+
+      attachBtn.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", () => { addFiles([...fileInput.files]); fileInput.value = ""; });
+      input.addEventListener("paste", (e) => {
+        const files = [...(e.clipboardData?.files || [])];
+        if (files.length) { e.preventDefault(); addFiles(files); }
+      });
+      let dragDepth = 0;
+      appEl.addEventListener("dragenter", (e) => {
+        if (![...e.dataTransfer.types].includes("Files")) return;
+        e.preventDefault(); dragDepth++; form.classList.add("dragging");
+      });
+      appEl.addEventListener("dragover", (e) => { if ([...e.dataTransfer.types].includes("Files")) e.preventDefault(); });
+      appEl.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; form.classList.remove("dragging"); } });
+      appEl.addEventListener("drop", (e) => {
+        e.preventDefault(); dragDepth = 0; form.classList.remove("dragging");
+        addFiles([...e.dataTransfer.files]);
+      });
+
+      async function loadLimits() {
+        try {
+          limits = await (await fetch("/attachments/limits")).json();
+          fileInput.accept = [...limits.accepted.image, ...limits.accepted.document].join(",");
+        } catch (e) {
+          console.error("could not load attachment limits", e);
+        }
+      }
 
       function autoGrow() {
         input.style.height = "auto";
         input.style.height = Math.min(input.scrollHeight, 200) + "px";
       }
-      input.addEventListener("input", autoGrow);
+      input.addEventListener("input", () => { autoGrow(); updateSend(); });
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
       });
@@ -166,7 +374,7 @@
         const val = [saved, preferred, serverDefault].find(exists);
         if (val) sel.value = val;
       }
-      providerSel.addEventListener("change", () => localStorage.setItem("ui.provider", providerSel.value));
+      providerSel.addEventListener("change", () => { localStorage.setItem("ui.provider", providerSel.value); renderChips(); });
       domainSel.addEventListener("change", () => localStorage.setItem("ui.domain", domainSel.value));
 
       async function loadProviders() {
@@ -174,12 +382,14 @@
           const res = await fetch("/providers");
           const data = await res.json();
           for (const p of data.providers) {
+            visionByProvider[p.id] = Boolean(p.supports_vision);
             const opt = document.createElement("option");
             opt.value = p.id;
-            opt.textContent = p.label;
+            opt.textContent = p.supports_vision ? `${p.label} · 👁 vision` : p.label;
             providerSel.appendChild(opt);
           }
           selectValue(providerSel, "ui.provider", "openai", data.default);
+          renderChips();
         } catch (e) {
           console.error("could not load providers", e);
         }
@@ -220,8 +430,50 @@
         messagesEl.scrollTop = messagesEl.scrollHeight;
       }
 
-      async function send(text) {
-        addMessage("user").textContent = text;
+      function attachmentNotice(evt) {
+        for (const item of evt.items) {
+          if (item.delivery === "image+ocr") {
+            const ocr = item.ocr && item.ocr.lines ? ` + ${item.ocr.lines} lines of recognized text` : "";
+            addNotice(`🖼️ ${item.name} → ${evt.model} (image${ocr})`, "file");
+          } else if (item.delivery === "ocr_only") {
+            addNotice(`🔤 ${item.name} → recognized text only (${evt.model} can't see images)`, "guard");
+          } else {
+            const parts = [`📎 ${item.name}`];
+            if (item.pages) parts.push(item.pages + (item.pages === 1 ? " page" : " pages"));
+            if (item.ocr && item.ocr.pages) parts.push(`${item.ocr.pages} pages OCR'd`);
+            parts.push(item.chars.toLocaleString() + " chars");
+            if (item.truncated) parts.push("truncated to fit the prompt");
+            addNotice(parts.join(" · "), "file");
+          }
+        }
+      }
+
+      function renderUserBubble(text, items) {
+        const bubble = addMessage("user");
+        if (items.length) {
+          const files = document.createElement("div");
+          files.className = "files";
+          for (const item of items) {
+            if (item.previewUrl) {
+              const img = document.createElement("img");
+              img.src = item.previewUrl;
+              img.alt = item.file.name;
+              img.title = item.file.name;
+              files.appendChild(img);
+            } else {
+              const doc = document.createElement("div");
+              doc.className = "doc";
+              doc.textContent = "📄 " + item.file.name;
+              files.appendChild(doc);
+            }
+          }
+          bubble.appendChild(files);
+        }
+        if (text) bubble.appendChild(document.createTextNode(text));
+      }
+
+      async function send(text, items) {
+        renderUserBubble(text, items);
         const bubble = addMessage("assistant");
         let acc = "";
 
@@ -233,6 +485,7 @@
             provider: providerSel.value,
             domain: domainSel.value,
             conversation_id: conversationId,
+            attachments: items.map((i) => i.descriptor.id),
           }),
         });
 
@@ -252,6 +505,7 @@
             try { evt = JSON.parse(raw.slice(5).trim()); } catch { continue; }
             if (evt.type === "token") { acc += evt.text; bubble.textContent = acc; }
             else if (evt.type === "meta") addNotice("📚 grounding on domain: " + evt.domain + " · " + evt.collection);
+            else if (evt.type === "attachments") attachmentNotice(evt);
             else if (evt.type === "tool") addNotice("🔧 tool · " + evt.name, "tool");
             else if (evt.type === "guardrail") { addNotice("🛡️ blocked (" + evt.stage + ") · Galileo Agent Control: " + evt.reason, "guard"); }
             else if (evt.type === "redacted") { bubble.textContent = evt.text; const verb = evt.action === "steer" ? (evt.revised ? "revised (steer)" : "withheld (steer, no revision)") : evt.action === "deny" ? "withheld (deny)" : evt.action; const lbl = evt.control ? "🛡️ output " + verb + " by Galileo Agent Control · " + evt.control : "🛡️ output withheld by Galileo Agent Control"; addNotice(lbl, "guard"); }
@@ -264,18 +518,25 @@
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
         const text = input.value.trim();
-        if (!text) return;
+        const items = pending.filter((i) => i.status === "ready");
+        if (sendBtn.disabled || (!text && !items.length)) return;
         appEl.classList.remove("empty");
         input.value = "";
         autoGrow();
-        sendBtn.disabled = true;
-        try { await send(text); }
+        // Sent chips move into the user bubble; failed ones are dropped.
+        pending = [];
+        renderChips();
+        busy = true;
+        updateSend();
+        try { await send(text, items); }
         catch (err) { addNotice("⚠️ " + err.message, "error"); }
-        finally { sendBtn.disabled = false; input.focus(); }
+        finally { busy = false; updateSend(); input.focus(); }
       });
 
       loadProviders();
       loadDomains();
+      loadLimits();
+      updateSend();
       input.focus();
     </script>
   </body>

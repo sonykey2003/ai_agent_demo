@@ -65,7 +65,8 @@ spec:
             failureThreshold: 120
           resources:
             requests: { cpu: "100m", memory: "256Mi" }
-            limits: { cpu: "1", memory: "1Gi" }
+            # 50 MB uploads and OCR of scanned PDF pages need more headroom.
+            limits: { cpu: "2", memory: "2Gi" }
 ---
 apiVersion: v1
 kind: Service

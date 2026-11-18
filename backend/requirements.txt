@@ -14,6 +14,16 @@ langchain-text-splitters>=0.3
 openai>=1.40
 psycopg[binary]>=3.2
 
+# Chat attachments: multipart uploads, document text, image normalization, and
+# OCR (RapidOCR ships its Chinese + English ONNX models inside the wheel).
+python-multipart>=0.0.20
+pypdf>=5.0
+pypdfium2>=4.30
+pillow>=11.0
+python-docx>=1.1
+rapidocr>=3.4
+onnxruntime>=1.20
+
 # Vendor-neutral OpenTelemetry
 opentelemetry-sdk>=1.27
 opentelemetry-exporter-otlp-proto-http>=1.27

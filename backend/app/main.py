@@ -16,12 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from opentelemetry.trace import Span, Status, StatusCode
 from pydantic import BaseModel, Field
+from starlette.datastructures import UploadFile
 
 from .agent.graph import assistant_node_name, build_agent
 from .agent.agent_control import (
@@ -39,15 +40,20 @@ from .agent.agent_control import (
     unbind_otel_trace_context,
 )
 from .agent.tools import rag_collection_scope
+from .attachments import ocr
+from .attachments.context import build_context
+from .attachments.processing import ACCEPTED_TYPES, process_upload
+from .attachments.store import Attachment, AttachmentError, get_store
 from .config import get_settings
 from .domains import DEFAULT_DOMAIN, get_domains
-from .providers import make_chat_model
+from .providers import make_chat_model, provider_supports_vision
 from .rag.ingest import ingest_all
 from .telemetry.otel import (
     active_domain_scope,
     active_genai_system_scope,
     apm_only_scope,
     set_guardrail_result,
+    set_turn_attachments,
     set_turn_input,
     set_turn_output,
     setup_telemetry,
@@ -92,10 +98,20 @@ async def _initialize_rag() -> None:
             await asyncio.sleep(settings.rag_startup_retry_seconds)
 
 
+def _warm_ocr() -> None:
+    try:
+        ocr.get_engine()
+    except Exception:  # noqa: BLE001
+        log.exception("OCR engine failed to load; image text recognition will fail.")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     setup_telemetry(_app)
     setup_agent_control()
+    if get_settings().attachment_ocr_enabled:
+        # Load the OCR models in the background so the first image upload is fast.
+        asyncio.get_running_loop().run_in_executor(None, _warm_ocr)
     try:
         await _initialize_rag()
         yield
@@ -133,6 +149,8 @@ class ChatRequest(BaseModel):
     conversation_id: str = Field(
         default_factory=lambda: str(uuid4()), min_length=1, max_length=128
     )
+    # IDs returned by POST /attachments for this conversation.
+    attachments: list[str] = Field(default_factory=list, max_length=20)
 
 
 def _sse(obj: dict) -> str:
@@ -158,6 +176,27 @@ def _chunk_text(chunk) -> str:
 _ROLES = {"human": "user", "ai": "assistant"}
 
 
+def _content_text(content) -> str:
+    """Message content as text; image blocks become a placeholder, never base64."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for piece in content:
+            if isinstance(piece, dict):
+                kind = piece.get("type")
+                if kind == "text":
+                    parts.append(piece.get("text") or "")
+                elif kind in ("image_url", "image"):
+                    parts.append("[image]")
+                else:
+                    parts.append(f"[{kind}]")
+            else:
+                parts.append(str(piece))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
 def _llm_message(m) -> dict | None:
     """One LangChain message in Galileo's shape.
 
@@ -169,7 +208,7 @@ def _llm_message(m) -> dict | None:
     content = getattr(m, "content", m)
     msg: dict = {
         "role": _ROLES.get(kind, kind),
-        "content": content if isinstance(content, str) else str(content),
+        "content": _content_text(content),
     }
     calls = [
         {
@@ -325,10 +364,109 @@ def providers() -> dict:
     return {
         "default": settings.llm_provider,
         "providers": [
-            {"id": p.name, "label": p.label, "model": p.model}
+            {
+                "id": p.name,
+                "label": p.label,
+                "model": p.model,
+                "supports_vision": provider_supports_vision(p),
+            }
             for p in settings.providers().values()
         ],
     }
+
+
+# Room for multipart boundaries and form fields on top of the file itself.
+_MULTIPART_OVERHEAD = 1024 * 1024
+_UPLOAD_CHUNK = 1024 * 1024
+
+
+async def _read_limited(upload: UploadFile, limit: int) -> bytes:
+    """Read an upload, stopping as soon as it exceeds the limit."""
+    chunks, total = [], 0
+    while chunk := await upload.read(_UPLOAD_CHUNK):
+        total += len(chunk)
+        if total > limit:
+            raise AttachmentError(
+                413, f"File is larger than {limit // (1024 * 1024)} MB."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.get("/attachments/limits")
+def attachment_limits() -> dict:
+    settings = get_settings()
+    return {
+        "max_mb": settings.attachment_max_mb,
+        "max_files": settings.attachment_max_files,
+        "accepted": ACCEPTED_TYPES,
+        "ocr_enabled": settings.attachment_ocr_enabled,
+        "ocr_languages": ocr.LANGUAGES,
+        "ocr_max_pages": settings.attachment_ocr_max_pages,
+        "max_pdf_pages": settings.attachment_max_pdf_pages,
+    }
+
+
+@app.post("/attachments")
+async def upload_attachment(request: Request) -> JSONResponse:
+    """Upload one file (multipart fields: file, conversation_id)."""
+    settings = get_settings()
+    limit = settings.attachment_max_mb * 1024 * 1024
+    # Upload traces are plain APM traces; keep them out of the LLM backends.
+    with apm_only_scope(), start_server_span(method="POST", route="/attachments") as span:
+        form = None
+        try:
+            declared = int(request.headers.get("content-length") or 0)
+            if declared > limit + _MULTIPART_OVERHEAD:
+                raise AttachmentError(
+                    413, f"File is larger than {settings.attachment_max_mb} MB."
+                )
+            form = await request.form(max_files=1, max_fields=4)
+            upload = form.get("file")
+            conversation_id = str(form.get("conversation_id") or "").strip()
+            if not isinstance(upload, UploadFile):
+                raise AttachmentError(422, "Missing 'file' field.")
+            if not conversation_id or len(conversation_id) > 128:
+                raise AttachmentError(422, "Missing or invalid 'conversation_id'.")
+            span.set_attribute("gen_ai.conversation.id", conversation_id)
+            span.set_attribute("session.id", conversation_id)
+            data = await _read_limited(upload, limit)
+            span.set_attribute("attachment.size_bytes", len(data))
+            attachment = await asyncio.to_thread(
+                process_upload, conversation_id, upload.filename or "upload", data
+            )
+        except AttachmentError as exc:
+            span.set_attribute("http.response.status_code", exc.status_code)
+            span.set_attribute("attachment.error", exc.message)
+            log.info("attachment rejected (%d): %s", exc.status_code, exc.message)
+            return JSONResponse({"error": exc.message}, status_code=exc.status_code)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("attachment processing failed")
+            span.record_exception(exc)
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_attribute("http.response.status_code", 500)
+            span.set_status(Status(StatusCode.ERROR, str(exc)))
+            return JSONResponse(
+                {"error": f"Could not process the file: {exc}"}, status_code=500
+            )
+        finally:
+            if form is not None:
+                await form.close()
+
+        span.set_attribute("attachment.id", attachment.id)
+        span.set_attribute("attachment.kind", attachment.kind)
+        span.set_attribute("attachment.mime_type", attachment.mime_type)
+        span.set_attribute("attachment.chars", len(attachment.text))
+        if attachment.meta.get("pages"):
+            span.set_attribute("attachment.pages", attachment.meta["pages"])
+        return JSONResponse(attachment.descriptor())
+
+
+@app.delete("/attachments/{attachment_id}")
+def delete_attachment(attachment_id: str, conversation_id: str) -> JSONResponse:
+    if not get_store().delete(conversation_id, attachment_id):
+        return JSONResponse({"error": "Attachment not found."}, status_code=404)
+    return JSONResponse({"deleted": attachment_id})
 
 
 @app.get("/domains")
@@ -530,6 +668,76 @@ async def _agent_control_stream(
     yield _sse({"type": "done"})
 
 
+_DEFAULT_ATTACHMENT_PROMPT = "Please review the attached file(s)."
+
+
+def _prepare_attachments(req: ChatRequest, cfg) -> tuple[list[Attachment], dict | None]:
+    """Validate and bind this turn's attachments.
+
+    Returns the attachments and the SSE notice describing how each reaches the
+    model. Raises AttachmentError before anything is bound when the turn can't
+    proceed (unknown id, too many files, image a text-only model can't use).
+    """
+    settings = get_settings()
+    store = get_store()
+    if not req.attachments:
+        store.begin_turn(req.conversation_id, [])
+        return [], None
+    if len(req.attachments) > settings.attachment_max_files:
+        raise AttachmentError(
+            422, f"Attach at most {settings.attachment_max_files} files per message."
+        )
+    vision = False
+    for attachment_id in req.attachments:
+        item = store.get(req.conversation_id, attachment_id)
+        if item is None:
+            raise AttachmentError(404, "An attachment expired or was removed; attach it again.")
+        if item.kind == "image":
+            vision = provider_supports_vision(cfg)
+            if not vision and not item.text.strip():
+                raise AttachmentError(
+                    422,
+                    f"{cfg.model} can't see images and no text was recognized in "
+                    f"{item.name}. Choose a vision model (e.g. OpenAI or a vision "
+                    "Ollama model).",
+                )
+    items = store.begin_turn(req.conversation_id, list(req.attachments))
+    budget = (
+        settings.attachment_inline_max_chars_local
+        if cfg.genai_system == "ollama"
+        else settings.attachment_inline_max_chars
+    )
+    _, truncated = build_context(
+        store.for_conversation(req.conversation_id), budget, vision=vision
+    )
+    notice = {
+        "type": "attachments",
+        "model": cfg.model,
+        "vision": vision,
+        "items": [
+            {
+                "name": a.name,
+                "kind": a.kind,
+                "delivery": (
+                    ("image+ocr" if vision else "ocr_only") if a.kind == "image" else "text"
+                ),
+                "pages": a.meta.get("pages"),
+                "chars": len(a.text),
+                "ocr": a.meta.get("ocr"),
+                "truncated": truncated.get(a.id, False),
+            }
+            for a in items
+        ],
+    }
+    return items, notice
+
+
+def _attachment_delivery(items: list[Attachment], vision: bool) -> str:
+    if any(a.kind == "image" for a in items):
+        return "image+ocr" if vision else "ocr_only"
+    return "text"
+
+
 async def _event_stream(req: ChatRequest):
     settings = get_settings()
     cfg = settings.providers().get(req.provider or settings.llm_provider)
@@ -545,6 +753,26 @@ async def _event_stream(req: ChatRequest):
         yield _sse({"type": "error", "message": f"Unknown domain: {req.domain}"})
         yield _sse({"type": "done"})
         return
+
+    try:
+        attachments, attachment_notice = await asyncio.to_thread(
+            _prepare_attachments, req, cfg
+        )
+    except AttachmentError as exc:
+        yield _sse({"type": "error", "message": exc.message})
+        yield _sse({"type": "done"})
+        return
+    if attachments and not req.message.strip():
+        req = req.model_copy(update={"message": _DEFAULT_ATTACHMENT_PROMPT})
+    attachment_refs = [a.descriptor() for a in attachments]
+
+    def _mark_attachments(span: Span) -> None:
+        if attachments:
+            set_turn_attachments(
+                span,
+                attachment_refs,
+                _attachment_delivery(attachments, attachment_notice["vision"]),
+            )
 
     # Per-domain tracing: native Galileo SDK for the configured domains (deepest
     # Agent Control integration -- rich control span + Controls tab); every other
@@ -567,8 +795,12 @@ async def _event_stream(req: ChatRequest):
             provider_name=cfg.genai_system,
             model=cfg.model,
             input_text=req.message,
+            attachments=attachment_refs,
         ) as turn_span:
             turn_span.set_attribute("domain.name", domain.name)
+            _mark_attachments(turn_span)
+            if attachment_notice:
+                yield _sse(attachment_notice)
             async for chunk in _agent_control_stream(
                 req, cfg, domain, apm_span=turn_span
             ):
@@ -588,11 +820,15 @@ async def _event_stream(req: ChatRequest):
         provider_name=cfg.genai_system,
         model=cfg.model,
         input_text=req.message,
+        attachments=attachment_refs,
     ) as turn_span:
         turn_span.set_attribute("domain.name", domain.name)
+        _mark_attachments(turn_span)
         yield _sse(
             {"type": "meta", "domain": domain.name, "collection": domain.collection}
         )
+        if attachment_notice:
+            yield _sse(attachment_notice)
 
         # Agent Control (optional): evaluate the user input as a distinct child
         # step so both allowed and blocked turns show the control in the trace.
@@ -743,7 +979,7 @@ async def _event_stream(req: ChatRequest):
         turn_span.set_attribute("agent.result", "completed")
         # Re-assert input: the streaming instrumentor overwrites gen_ai.input.messages
         # with an empty capture during the run, so restore it after the loop.
-        set_turn_input(turn_span, req.message)
+        set_turn_input(turn_span, req.message, attachment_refs)
         set_turn_output(turn_span, displayed_answer)
         if redacted:
             payload = {

@@ -138,6 +138,56 @@ kubectl apply -f deploy/k8s/backend.yaml
 Create `deploy/k8s/secrets.yaml` from the example before deployment. Restart the
 backend deployment after changing bundled knowledge to rebuild the collection.
 
+## Attachments (files & pictures)
+
+Attach files with the 📎 button, drag-and-drop onto the composer, or paste an
+image. Up to 4 files per message, 50 MB each (`ATTACHMENT_MAX_MB`):
+
+- **Images:** PNG, JPEG, WebP. The model copy is rotated per EXIF, stripped of
+  metadata (including GPS), and downscaled to 1568 px.
+- **Documents:** PDF, DOCX, TXT, MD, CSV. Their text is added to the prompt with a
+  citation id (e.g. `[statement]`), up to 12,000 characters per conversation (4,000
+  for the local model); longer text is truncated and the UI says so.
+- **Text recognition (OCR):** every image and every scanned PDF page (up to 20 per
+  PDF) is read with [RapidOCR](https://github.com/RapidAI/RapidOCR) in English and
+  Chinese. Its models ship in the Python wheel, so nothing is downloaded at runtime.
+
+How an image reaches the model depends on the selected model, marked
+`👁 vision` in the Model dropdown:
+
+| Model | Gets |
+|-------|------|
+| Vision (`OPENAI_SUPPORTS_VISION=true`, or an Ollama model with the `vision` capability such as `gemma4`) | The image plus its recognized text |
+| Text-only (`qwen2.5:0.5b`, the default OpenRouter model) | Only the recognized text; the chip shows `🔤 text only` |
+
+A text-only model with an image in which no text was recognized gets a clear
+error instead of a guess. Images stay visible to vision models for the turn they
+were sent in and the next one (`ATTACHMENT_IMAGE_CARRYOVER_TURNS`).
+
+Attachments live in backend memory alongside the conversation history, so they
+disappear on restart (and after 24 hours). The API is `POST /attachments`
+(multipart `file` + `conversation_id`), `DELETE /attachments/{id}`, and
+`GET /attachments/limits`; `/chat` takes the returned ids in `attachments`.
+
+Observability: each upload is its own `POST /attachments` trace (APM only) with
+`validate attachment`, `normalize image` / `extract text`, and `ocr image` /
+`ocr pdf page` spans carrying OCR confidence, line count, and timing. The chat
+turn span records `attachment.count`, `attachment.ids`, and
+`attachment.delivery` (`image+ocr`, `ocr_only`, `text`), and its
+`gen_ai.input.messages` adds GenAI semantic-convention `uri` / `file` parts
+referencing the attachments. Base64 image data is replaced with a size/hash
+stub before export (`TELEMETRY_INLINE_MEDIA=false`) so vision prompts don't
+inflate LLM spans. Agent Control output checks apply as usual — e.g. a PII
+control masks a card number read from a receipt.
+
+Demo prompts:
+
+- **Bank** · attach a receipt photo → "What is the total and which card was used?"
+- **Bank** · attach a scanned statement PDF → "Which charge looks suspicious?"
+- **Restaurant** · attach a Chinese supplier invoice photo → "What did we order and what's the total?"
+- Switch to the OpenRouter model and repeat with the receipt to show the
+  recognized-text-only path.
+
 ## Trace model
 
 Every `/chat` turn creates one trace rooted at a `POST /chat` span of kind

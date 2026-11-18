@@ -6,6 +6,9 @@ metadata:
   namespace: agent-demo
   annotations:
     nginx.ingress.kubernetes.io/proxy-buffering: "off"  # keep SSE streaming live
+    # 50 MB attachment uploads (+ multipart overhead) and multi-page OCR time.
+    nginx.ingress.kubernetes.io/proxy-body-size: "60m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
 spec:
   rules:
     - host: agent-chat.local

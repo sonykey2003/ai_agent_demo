@@ -12,13 +12,17 @@ from functools import lru_cache
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from opentelemetry import trace
 
-from ..providers import make_chat_model
+from ..attachments.context import ATTACHMENT_POLICY, build_context, image_blocks
+from ..attachments.store import get_store
+from ..config import get_settings
+from ..providers import make_chat_model, provider_supports_vision
 from ..domains import get_domains
 from .tools import retrieve_context, tools_for_domain
 
@@ -153,6 +157,8 @@ def build_agent(
     (tools) -> validate_answer.
     """
     model = make_chat_model(provider=provider, temperature=temperature)
+    settings = get_settings()
+    provider_cfg = settings.providers()[provider or settings.llm_provider]
     tools = tools_for_domain(domain)
     model_with_tools = model.bind_tools(tools)
     prompt = SYSTEM_PROMPT
@@ -207,16 +213,72 @@ def build_agent(
             ],
         }
 
-    async def assistant_node(state: AgentState) -> dict:
+    async def assistant_node(state: AgentState, config: RunnableConfig) -> dict:
         """Generate the answer from the retrieved context; may request a tool."""
         context = state.get("context", "")
         system = (
             f"{prompt}\n\nRelevant context passages:\n\n{context}" if context else prompt
         )
-        response = await model_with_tools.ainvoke(
-            [SystemMessage(content=system), *state["messages"]]
-        )
+        messages = list(state["messages"])
+        conversation_id = (config.get("configurable") or {}).get("thread_id")
+        attachments = get_store().for_conversation(conversation_id) if conversation_id else []
+        if attachments:
+            system, messages = _with_attachments(
+                system, messages, attachments, conversation_id
+            )
+        response = await model_with_tools.ainvoke([SystemMessage(content=system), *messages])
         return {"messages": [response]}
+
+    def _with_attachments(system, messages, attachments, conversation_id):
+        """Add attachment text to the prompt and, for vision models, the images.
+
+        The multimodal message is built for this model call only; the checkpointed
+        history keeps the plain-text user message.
+        """
+        settings = get_settings()
+        vision = provider_supports_vision(provider_cfg)
+        budget = (
+            settings.attachment_inline_max_chars_local
+            if provider_cfg.genai_system == "ollama"
+            else settings.attachment_inline_max_chars
+        )
+        block, _ = build_context(attachments, budget, vision=vision)
+        system = f"{system}{ATTACHMENT_POLICY}\n\n{block}"
+        current_turn = get_store().current_turn(conversation_id)
+        last_human = next(
+            (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+            None,
+        )
+        if last_human is None:
+            return system, messages
+        original = messages[last_human]
+        text = original.content if isinstance(original.content, str) else ""
+        # Say which files came with this message, so "this document" resolves to
+        # them rather than to an earlier attachment.
+        attached_now = [a for a in attachments if a.turn == current_turn]
+        if attached_now:
+            names = ", ".join(f"{a.name} [{a.cite_id}]" for a in attached_now)
+            text = f"{text}\n\n(Attached to this message: {names})"
+        images = (
+            image_blocks(
+                attachments,
+                current_turn,
+                settings.attachment_image_carryover_turns,
+                settings.attachment_image_detail,
+            )
+            if vision
+            else []
+        )
+        if images:
+            content: list[dict] = [{"type": "text", "text": text}]
+            for attachment, block in images:
+                when = "attached to this message" if attachment.turn == current_turn else "from an earlier message"
+                content.append({"type": "text", "text": f"Image {attachment.name} ({when}):"})
+                content.append(block)
+            messages[last_human] = HumanMessage(content=content, id=original.id)
+        elif attached_now:
+            messages[last_human] = HumanMessage(content=text, id=original.id)
+        return system, messages
 
     def validate_answer_node(state: AgentState) -> dict:
         """Lightweight post-check recorded on the span (non-empty, cites sources)."""
