@@ -13,6 +13,8 @@ Usage:
     python eval/upload_galileo_dataset.py --domain ecomm             # upload dataset
     python eval/upload_galileo_dataset.py --domain ecomm --preview   # show, don't upload
     python eval/upload_galileo_dataset.py --domain ecomm --baseline --provider local
+    python eval/upload_galileo_dataset.py --domain ecomm \
+        --file domains/ecomm/commitment_probes.csv --name "Ecomm Commitment Probes"
 """
 
 from __future__ import annotations
@@ -110,19 +112,27 @@ def main() -> int:
         help="After upload, run a baseline experiment scoring adherence metrics.",
     )
     parser.add_argument("--provider", default="local", help="openai | openrouter | local")
+    parser.add_argument(
+        "--file",
+        type=Path,
+        help="input,output CSV to upload instead of domains/<domain>/dataset.csv.",
+    )
+    parser.add_argument("--name", help="Dataset name (default: '<Domain> Domain Dataset').")
     args = parser.parse_args()
 
     _load_dotenv()
     _resolve_console_url()
 
-    dataset_file = REPO_ROOT / "domains" / args.domain / "dataset.csv"
+    dataset_file = (
+        REPO_ROOT / args.file if args.file and not args.file.is_absolute() else args.file
+    ) or REPO_ROOT / "domains" / args.domain / "dataset.csv"
     if not dataset_file.is_file():
         print(f"ERROR: {dataset_file} not found. Run: python eval/build_dataset.py --domain {args.domain}")
         return 1
 
     content = read_dataset_csv(dataset_file)
     project = os.environ.get("GALILEO_PROJECT", "default")
-    dataset_name = _dataset_name(args.domain)
+    dataset_name = args.name or _dataset_name(args.domain)
 
     print(f"Domain  : {args.domain}")
     print(f"Project : {project}")
@@ -147,8 +157,12 @@ def main() -> int:
     try:
         dataset = create_dataset(name=dataset_name, content=content, project_name=project)
         print(f"Created dataset '{dataset_name}' (id={getattr(dataset, 'id', '?')}).")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         dataset = get_dataset(name=dataset_name, project_name=project)
+        if dataset is None:
+            # Dataset names are unique org-wide; one owned by someone else is invisible here.
+            print(f"ERROR: could not create '{dataset_name}': {exc}\nRe-run with --name to pick another name.")
+            return 1
         print(f"Dataset '{dataset_name}' already exists; reusing (id={getattr(dataset, 'id', '?')}).")
 
     if not args.baseline:

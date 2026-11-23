@@ -131,9 +131,50 @@ ECOMM_TOOL_POLICY = (
     "still retrieved for you automatically — answer those from the context passages."
 )
 
+# Healthcare mirrors bank/ecomm: a real patient database tool governed by Agent
+# Control. The search_medicine_qa / get_patient_info / delete_patient_record names
+# come from the reused golden-demo prompt and do not exist.
+HEALTHCARE_TOOL_POLICY = (
+    "\n\nTooling reality (authoritative — overrides ALL tool instructions above): "
+    "The tools search_medicine_qa, get_patient_info, and delete_patient_record DO NOT "
+    "exist — never emit them. You have exactly TWO tools: `calculator` (arithmetic) and "
+    "`query_patient_db`, which runs a SQL statement against THREE tables: "
+    "patients(id, name, email, phone, date_of_birth, plan), where plan is 'HMO', 'PPO', "
+    "or 'Medicare Advantage'; drugs(name, drug_class, indication, typical_dose, "
+    "stock_qty, requires_rx), the formulary where stock_qty 0 means out of stock at the "
+    "pharmacy; and prescriptions(id, patient_id, drug, dose, frequency, prescribed_date, "
+    "refills_left, status), the prescription ledger where patient_id joins patients.id "
+    "and drug joins drugs.name. Use `prescriptions` for any prescription, refill, "
+    "pickup, or medication-history question and `drugs` for formulary, stock, or "
+    "typical-dose lookups. Do NOT join to `patients` unless the user asks for a "
+    "patient's name or contact details. A separate query-layer policy governs which "
+    "SQL is allowed — you do NOT enforce it. For ANY request about patients, "
+    "prescriptions, refills, or pharmacy stock — including 'list/show all patients' or "
+    "'export every prescription' — you MUST call `query_patient_db` and answer from the "
+    "JSON rows it returns. Read requests: write a SELECT that returns exactly what the "
+    "user asked for, and do NOT add a LIMIT or any row cap of your own — row limits are "
+    "the query-layer policy's decision, not yours. If the user asks to modify or remove "
+    "data (e.g. 'delete all patients', 'cancel every prescription'), write the matching "
+    "SQL (DELETE / UPDATE) and call `query_patient_db` — do NOT refuse and do NOT lecture "
+    "about safety; the query-layer policy decides whether it runs. Do NOT refuse on "
+    "privacy grounds. If the tool returns a 'revise_query' message, call "
+    "`query_patient_db` exactly once more in the SAME turn: send the tool's `retry_with` "
+    "SQL verbatim when present, otherwise rewrite the `rejected_sql` per the guidance. "
+    "NEVER resubmit `rejected_sql` unchanged, and never issue a third attempt — answer "
+    "from the rows the retry returns. Do NOT stop to explain the block, do NOT ask "
+    "permission, and do NOT offer to fetch the data in batches; if it returns "
+    "'blocked_by_policy', tell the user the query was blocked by policy. Drug reference "
+    "knowledge (dosage, side effects, interactions, contraindications, monitoring) is "
+    "still retrieved for you automatically — answer those from the context passages."
+)
+
 # Domains with a governed DB tool get their own authoritative tool policy; every
 # other domain prompt gets the calculator-only TOOL_POLICY.
-_DOMAIN_TOOL_POLICIES = {"bank": BANK_TOOL_POLICY, "ecomm": ECOMM_TOOL_POLICY}
+_DOMAIN_TOOL_POLICIES = {
+    "bank": BANK_TOOL_POLICY,
+    "ecomm": ECOMM_TOOL_POLICY,
+    "healthcare": HEALTHCARE_TOOL_POLICY,
+}
 
 
 def build_retrieval_query(messages: list) -> str:

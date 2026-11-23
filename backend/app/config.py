@@ -128,7 +128,7 @@ class Settings(BaseSettings):
     # your existing OTel" story). Each native domain traces into the log stream
     # named after it. Empty = all domains on OTel. NOT named GALILEO_MODE -- that
     # env var is reserved by the Galileo SDK (logger mode).
-    agent_control_native_domains: str = "bank,ecomm"
+    agent_control_native_domains: str = "bank,ecomm,healthcare"
     # When true, Agent Control emits its control spans over OTLP (the "otel"
     # observability sink) nested into the app's OTel trace -- so the typed control
     # span shows on the OTel path with no GalileoLogger. Overrides native domains.

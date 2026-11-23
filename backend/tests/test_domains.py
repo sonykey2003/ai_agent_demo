@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from app import domains as domains_mod
 from app.agent import agent_control, tools
 from app.agent.agent_control import ControlSteerError
@@ -52,14 +54,19 @@ def test_db_tools_are_scoped_to_their_domain() -> None:
     names = lambda d: {t.name for t in tools.tools_for_domain(d)}  # noqa: E731
     assert names("ecomm") == {"calculator", "query_order_db"}
     assert names("bank") == {"calculator", "query_customer_db"}
-    assert names("healthcare") == {"calculator"}
+    assert names("healthcare") == {"calculator", "query_patient_db"}
+    assert names("insurance") == {"calculator"}
 
 
-def test_order_db_reseeds_after_destructive_sql() -> None:
-    deleted = json.loads(tools.query_order_db.invoke({"sql": "DELETE FROM orders"}))
+@pytest.mark.parametrize(
+    ("db_tool", "ledger"),
+    [(tools.query_order_db, "orders"), (tools.query_patient_db, "prescriptions")],
+)
+def test_domain_db_reseeds_after_destructive_sql(db_tool, ledger) -> None:
+    deleted = json.loads(db_tool.invoke({"sql": f"DELETE FROM {ledger}"}))
     assert deleted["rows_affected"] == 48
 
-    count = json.loads(tools.query_order_db.invoke({"sql": "SELECT count(*) n FROM orders"}))
+    count = json.loads(db_tool.invoke({"sql": f"SELECT count(*) n FROM {ledger}"}))
     assert count["data"] == [{"n": 48}]
 
 

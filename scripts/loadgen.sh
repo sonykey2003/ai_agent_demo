@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 #
 # Drive chat traffic at the backend so traces, logs and DB activity appear in the
-# configured backends. Bank and ecomm are excluded by default: those domains run
-# the native Galileo path (Agent Control native domains), so their OTel spans go
-# to Splunk APM only. Include them with DOMAINS="bank ecomm".
+# configured backends. Bank, ecomm, and healthcare are excluded by default: those
+# domains run the native Galileo path (Agent Control native domains), so their
+# OTel spans go to Splunk APM only. Include them with DOMAINS="bank ecomm healthcare".
 #
 #   ./scripts/loadgen.sh                 # 5 rounds over the default domains
 #   ITERATIONS=20 ./scripts/loadgen.sh
-#   DOMAINS="healthcare" ./scripts/loadgen.sh
+#   DOMAINS="insurance" ./scripts/loadgen.sh
 #   BASE_URL=http://localhost:8800 DELAY=5 ./scripts/loadgen.sh
 
 base_url="${BASE_URL:-http://localhost:8800}"
-domains="${DOMAINS:-healthcare insurance restaurant}"
+domains="${DOMAINS:-insurance restaurant}"
 iterations="${ITERATIONS:-5}"
 delay="${DELAY:-2}"
 
 prompts_for() {
     case "$1" in
         healthcare)
-            echo "What is covered for water damage under my plan?
-How do I request a referral to a specialist?
-What happens if I miss a premium payment?" ;;
+            echo "What are the common side effects of Metformin?
+Which prescriptions are due for a refill?
+What monitoring is required when taking Atorvastatin?" ;;
         insurance)
             echo "How do I file a claim after a car accident?
 What is my deductible for storm damage?

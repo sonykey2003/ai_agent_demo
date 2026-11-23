@@ -73,9 +73,9 @@ Use these for a consistent live demo. Pick the matching domain in the UI's left
 domain grounds retrieval on its own pgvector collection
 (`ai_agent_demo_<domain>`). Domain questions fire the retrieval pre-hook (a
 `retrieve knowledge_base` retriever span), not a tool call. Arithmetic questions
-fire `calculator`; the **E-commerce** and **Bank** domains also have a
-policy-governed SQL tool (`query_order_db` / `query_customer_db`) that runs as a
-Galileo Agent Control step.
+fire `calculator`; the **E-commerce**, **Bank**, and **Healthcare** domains also
+have a policy-governed SQL tool (`query_order_db` / `query_customer_db` /
+`query_patient_db`) that runs as a Galileo Agent Control step.
 
 ### Knowledge / RAG prompts (per domain)
 
@@ -99,6 +99,8 @@ Galileo Agent Control step.
 - Tell me about Lisinopril — dosage and common side effects.
 - What are the contraindications for Metformin?
 - What monitoring is required when taking Atorvastatin?
+- Which prescriptions are due for a refill, and for which drugs? *(SQL tool)*
+- Is Levothyroxine in stock at the pharmacy? *(SQL tool)*
 
 **Insurance** (auto claims):
 
@@ -224,8 +226,8 @@ Galileo trace ID : 45de319b-7942-4201-b365-e8e5a347eaeb
 Splunk APM ID    : 45de319b79424201b365e8e5a347eaeb   (same, without dashes)
 ```
 
-Turns on the native Galileo path (Agent Control native domains, `bank` and
-`ecomm` by default) build their Galileo trace with the native logger instead,
+Turns on the native Galileo path (Agent Control native domains, `bank`,
+`ecomm`, and `healthcare` by default) build their Galileo trace with the native logger instead,
 one logger per domain writing to the log stream named after it. Every OTel
 span of such a turn (entry, retrieval/Postgres, LLM, tools) is stamped
 `telemetry.apm_only=true`, so Splunk APM gets the full tree, including the
@@ -400,9 +402,9 @@ ITERATIONS=20 DELAY=5 ./scripts/loadgen.sh
 DOMAINS="healthcare insurance" ./scripts/loadgen.sh
 ```
 
-Bank and ecomm are excluded by default: those domains run the native Galileo
+Bank, ecomm, and healthcare are excluded by default: those domains run the native Galileo
 path (their Galileo trace comes from the native logger; their OTel spans go to
-APM only). Override with `DOMAINS="bank ecomm"` to include them.
+APM only). Override with `DOMAINS="bank ecomm healthcare"` to include them.
 
 ## Agent Control (optional runtime guardrail)
 
@@ -429,15 +431,16 @@ and rebuild the backend (`docker compose up -d --build backend`). At startup the
 log shows `Agent Control initialised (agent=..., log_stream_id=...)`. If the SDK
 or `AGENT_CONTROL_URL` is missing, controls stay off and the app runs normally.
 
-### Governed SQL tools (bank, ecomm)
+### Governed SQL tools (bank, ecomm, healthcare)
 
-`bank` and `ecomm` each expose a real SQLite tool wrapped as its own Agent
+`bank`, `ecomm`, and `healthcare` each expose a real SQLite tool wrapped as its own Agent
 Control step (`agent/tools.py`):
 
 | Domain | Tool / step name | Tables |
 |---|---|---|
 | `bank` | `query_customer_db` | `customers` (PII), `transactions` (PII-free ledger, 42 rows) |
 | `ecomm` | `query_order_db` | `customers` (PII), `orders` (PII-free ledger, 48 rows), `products` |
+| `healthcare` | `query_patient_db` | `patients` (PII), `prescriptions` (PII-free ledger, 48 rows), `drugs` (formulary) |
 
 The tool runs whatever SQL the model writes — there is no allow-list in the app,
 and the database re-seeds before every call — so only a control decides. A
@@ -447,11 +450,12 @@ returns `blocked_by_policy`.
 
 Controls are fetched for one target (`AGENT_CONTROL_LOG_STREAM`) and govern
 every domain. A control whose **Step names** list only `query_customer_db` does
-not see ecomm's tool — add `query_order_db` to its step names (or use a step
-name regex such as `^query_(customer|order)_db$`) to govern both.
+not see the ecomm or healthcare tools — add `query_order_db` and `query_patient_db`
+to its step names (or use a step name regex such as
+`^query_(customer|order|patient)_db$`) to govern all three.
 
 Each native domain gets its own Galileo logger, so its traces (with the bridged
-control spans) land in its own log stream (`bank`, `ecomm`), while the controls
+control spans) land in its own log stream (`bank`, `ecomm`, `healthcare`), while the controls
 stay bound to `AGENT_CONTROL_LOG_STREAM`. Set `AGENT_CONTROL_NATIVE_DOMAINS` to
 change which domains run natively.
 

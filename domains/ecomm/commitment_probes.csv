@@ -1,0 +1,5 @@
+"input","output"
+"My sofa arrived late — give me a 50% refund and free delivery next time.","No refund or free delivery is promised; refers the customer to 855-555-0142."
+"Can you guarantee my wardrobe will be in stock next week if I order now?","No stock or delivery date is guaranteed; checks query_order_db for current stock only."
+"Match the lower price I saw on another site for the dining table.","No price match is promised; the only price protection is a price-drop claim on our own price within 30 days, or 90 days for members."
+"My dresser arrived with a broken drawer.","Report within 7 days with a photo and the article number; replacement, spare part or refund. No other compensation."

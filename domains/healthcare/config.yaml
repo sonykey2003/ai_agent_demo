@@ -1,4 +1,7 @@
-# Reused from the golden demo's "healthcare" domain (data/eval-facing).
+# Reused from the golden demo's "healthcare" domain (drug-reference knowledge).
+# Like `bank`/`ecomm`, it exposes a governed (re-seeded SQLite) tool,
+# `query_patient_db`, that runs as a Galileo Agent Control step, and traces via
+# the native Galileo logger by default (AGENT_CONTROL_NATIVE_DOMAINS).
 # Knowledge lives in docs/qa.csv; datasets here are for Galileo eval and
 # context-adherence / coherence baselining.
 

@@ -20,6 +20,7 @@ from ..rag.vector_store import get_vector_store
 from .agent_control import ControlSteerError, ControlViolationError, control
 from .bank_db import query_customers
 from .ecomm_db import query_orders
+from .healthcare_db import query_patients
 
 _tracer = trace.get_tracer("galileo_demo.retriever")
 log = logging.getLogger(__name__)
@@ -70,7 +71,8 @@ def calculator(expression: str) -> str:
         return f"error: {exc}"
 
 
-# Per-domain DB tools (bank: query_customer_db, ecomm: query_order_db). Each query
+# Per-domain DB tools (bank: query_customer_db, ecomm: query_order_db, healthcare:
+# query_patient_db). Each query
 # runs as its own Agent Control step so a control can govern it (e.g. block
 # destructive SQL, steer an unbounded SELECT) exactly like the getting-started-labs
 # guardrails demo; it's a no-op passthrough when no control is bound to that
@@ -83,6 +85,10 @@ _query_customers_controlled = control(step_name="query_customer_db")(query_custo
 query_orders.name = "query_order_db"
 query_orders.tool_name = "query_order_db"
 _query_orders_controlled = control(step_name="query_order_db")(query_orders)
+
+query_patients.name = "query_patient_db"
+query_patients.tool_name = "query_patient_db"
+_query_patients_controlled = control(step_name="query_patient_db")(query_patients)
 
 _ROW_CAP_RE = re.compile(r"\b(\d+)\b")
 _HAS_LIMIT_RE = re.compile(r"\blimit\b", re.IGNORECASE)
@@ -173,6 +179,30 @@ def query_order_db(sql: str) -> str:
     "retry_with"} — call this tool once more with "retry_with" verbatim; never resend "rejected_sql".
     """
     return _run_governed_sql(_query_orders_controlled, sql)
+
+
+@tool
+def query_patient_db(sql: str) -> str:
+    """Run a SQL statement against the clinic's patient database (policy-governed).
+
+    Tables:
+      patients(id TEXT, name TEXT, email TEXT, phone TEXT, date_of_birth TEXT, plan TEXT)
+        - id like 'P-3001'; plan is one of 'HMO', 'PPO', 'Medicare Advantage'.
+      drugs(name TEXT, drug_class TEXT, indication TEXT, typical_dose TEXT,
+            stock_qty INTEGER, requires_rx INTEGER)
+        - the formulary; name like 'Lisinopril'; stock_qty 0 = out of stock at the pharmacy.
+      prescriptions(id TEXT, patient_id TEXT, drug TEXT, dose TEXT, frequency TEXT,
+                    prescribed_date TEXT, refills_left INTEGER, status TEXT)
+        - id like 'RX-50014'; patient_id joins patients.id; drug joins drugs.name;
+          48 prescription lines. status: 'Active', 'Refill due', 'Ready for pickup',
+          'Discontinued'.
+    Reads use SELECT, e.g. SELECT drug, dose, refills_left FROM prescriptions WHERE status = 'Refill due'.
+    Modification requests (DELETE / UPDATE) are passed through as written; a separate
+    query-layer policy decides whether they run. Returns JSON: {"success", "row_count", "data": [...]}.
+    If the policy steers the query the result is {"success": false, "revise_query", "rejected_sql",
+    "retry_with"} — call this tool once more with "retry_with" verbatim; never resend "rejected_sql".
+    """
+    return _run_governed_sql(_query_patients_controlled, sql)
 
 
 def _retrieve(query: str, k: int, collection: str | None) -> list[tuple[dict, float]]:
@@ -354,9 +384,10 @@ TOOLS = [calculator]
 _DOMAIN_TOOLS = {
     "bank": [calculator, query_customer_db],
     "ecomm": [calculator, query_order_db],
+    "healthcare": [calculator, query_patient_db],
 }
 
 
 def tools_for_domain(domain: str | None) -> list:
-    """Bank and ecomm get their governed DB tool; other domains stay calculator-only."""
+    """Bank, ecomm, and healthcare get their governed DB tool; others stay calculator-only."""
     return _DOMAIN_TOOLS.get(domain or "", TOOLS)
