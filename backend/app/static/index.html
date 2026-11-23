@@ -6,82 +6,127 @@
     <title>AI Agent Chat — Observability Demo</title>
     <style>
       :root {
-        --bg: #0d1117;
-        --panel: #161b22;
-        --panel-2: #1c2330;
-        --border: #2d333b;
-        --text: #e6edf3;
-        --muted: #8b949e;
-        --accent: #2f81f7;
-        --user: #1f6feb;
-        --tool: #8957e5;
-        --guard: #d29922;
-        --error: #f85149;
+        /* Per-domain theme; overwritten by applyDomainTheme(). */
+        --tint: #f1f4f8;
+        --accent: #2563eb;
+        --accent-soft: color-mix(in srgb, var(--accent) 12%, white);
+        --panel: #ffffff;
+        --panel-2: #f7f8fa;
+        --border: #e3e7ee;
+        --text: #1f2937;
+        --muted: #6b7280;
+        --tool: #6d28d9;
+        --guard: #b45309;
+        --error: #b91c1c;
       }
       * { box-sizing: border-box; }
+      html, body { height: 100%; }
       body {
         margin: 0;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        background: radial-gradient(1100px 520px at 50% -8%, #122339, #07090d);
+        background: #fff;
         color: var(--text);
-        height: 100vh;
-        padding: 24px;
       }
-      .app {
-        display: flex; flex-direction: column;
-        width: 100%; max-width: 880px; height: 100%;
-        margin: 0 auto;
-        background: var(--bg);
-        border: 1px solid var(--border);
-        border-radius: 18px;
-        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
-        overflow: hidden;
-      }
-      .topbar {
-        display: flex; align-items: center; gap: 10px;
-        padding: 16px 22px; border-bottom: 1px solid var(--border); background: var(--panel);
-      }
-      .brand { font-weight: 600; font-size: 16px; }
-      .brand span { color: var(--muted); font-weight: 400; font-size: 12px; }
+      .app { display: flex; height: 100vh; }
 
-      .body { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-      .app.empty .body { justify-content: center; }
+      /* ---- Left sidebar ---- */
+      .sidebar {
+        width: 248px; flex: none; display: flex; flex-direction: column;
+        border-right: 1px solid var(--border);
+        background-color: color-mix(in srgb, var(--tint) 30%, white);
+        transition: background-color 0.35s ease;
+      }
+      .brand { padding: 20px 18px 16px; border-bottom: 1px solid var(--border); }
+      .brand-name { font-weight: 600; font-size: 15px; }
+      .brand-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+      .side-section { padding: 14px 10px 4px; }
+      .side-head {
+        width: 100%; display: flex; align-items: center; justify-content: space-between;
+        background: none; border: 0; padding: 2px 8px 8px; cursor: pointer;
+        color: var(--muted); font-size: 13px; font-weight: 600; font-family: inherit;
+      }
+      .side-head .chev { transition: transform 0.15s; font-size: 11px; }
+      .side-section.collapsed .chev { transform: rotate(-90deg); }
+      .side-section.collapsed .side-body { display: none; }
+      .domain-list { display: flex; flex-direction: column; gap: 2px; }
+      .domain-item {
+        display: flex; align-items: center; gap: 10px; width: 100%;
+        background: none; border: 0; border-radius: 8px; padding: 8px 10px;
+        color: var(--text); font-size: 14px; font-family: inherit; text-align: left; cursor: pointer;
+      }
+      .domain-item:hover { background: rgba(15, 23, 42, 0.05); }
+      .domain-item .dot {
+        width: 10px; height: 10px; border-radius: 50%; flex: none;
+        background: var(--dot-accent); box-shadow: 0 0 0 3px var(--dot-tint);
+      }
+      .domain-item[aria-current="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+      .domain-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+      .side-btn {
+        width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px;
+        background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+        padding: 7px 10px; font-size: 13px; font-family: inherit; color: var(--text); cursor: pointer;
+      }
+      .side-btn:hover { border-color: var(--accent); color: var(--accent); }
+      .side-foot {
+        margin-top: auto; padding: 14px 18px; border-top: 1px solid var(--border);
+        font-size: 12px; color: var(--muted); line-height: 1.5;
+      }
+      .side-foot code { color: var(--accent); font-size: 12px; }
 
-      .hero { text-align: center; padding: 0 24px 24px; }
-      .hero h1 { font-size: 27px; font-weight: 600; margin: 0; }
+      /* ---- Main chat area (tinted per domain) ---- */
+      .main {
+        flex: 1; min-width: 0; display: flex; flex-direction: column;
+        background-color: var(--tint);
+        background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 0) 55%);
+        transition: background-color 0.35s ease;
+      }
+      .app.empty .main { justify-content: center; }
+      .column { width: 100%; max-width: 820px; margin: 0 auto; }
+
+      .hero { text-align: center; padding: 0 24px 22px; }
+      .hero .pill {
+        display: inline-block; font-size: 12px; font-weight: 600; color: var(--accent);
+        background: var(--accent-soft); border-radius: 999px; padding: 3px 10px; margin-bottom: 12px;
+      }
+      .hero h1 { font-size: 26px; font-weight: 600; margin: 0; }
       .hero p { color: var(--muted); margin: 10px 0 0; font-size: 14px; }
       .app:not(.empty) .hero { display: none; }
 
-      #messages { flex: 1; overflow-y: auto; padding: 24px 22px; display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+      #messages { flex: 1; overflow-y: auto; min-height: 0; }
+      #messages .column { padding: 28px 22px; display: flex; flex-direction: column; gap: 14px; }
       .app.empty #messages { display: none; }
       .msg { display: flex; }
       .msg.user { justify-content: flex-end; }
       .bubble {
-        max-width: 82%; padding: 14px 18px; border-radius: 16px; line-height: 1.55;
-        white-space: pre-wrap; word-wrap: break-word; font-size: 16px;
+        max-width: 82%; padding: 12px 16px; border-radius: 16px; line-height: 1.55;
+        white-space: pre-wrap; word-wrap: break-word; font-size: 15px;
       }
-      .msg.user .bubble { background: var(--user); color: #fff; border-bottom-right-radius: 4px; }
-      .msg.assistant .bubble { background: var(--panel-2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+      .msg.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+      .msg.assistant .bubble {
+        background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 4px;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      }
       .notice {
         align-self: center; font-size: 12px; padding: 4px 10px; border-radius: 999px;
         border: 1px solid var(--border); color: var(--muted); background: var(--panel);
       }
-      .notice.tool { color: #c8a6ff; border-color: var(--tool); }
-      .notice.guard { color: #f2cc60; border-color: var(--guard); }
-      .notice.error { color: #ff7b72; border-color: var(--error); }
+      .notice.tool { color: var(--tool); border-color: #c4b5fd; }
+      .notice.guard { color: var(--guard); border-color: #fcd34d; }
+      .notice.error { color: var(--error); border-color: #fca5a5; }
+      .notice.file { color: var(--accent); border-color: var(--accent); }
 
-      .composer-wrap { padding: 14px 22px 20px; }
+      .composer-wrap { padding: 12px 22px 22px; }
       .app.empty .composer-wrap { padding-top: 0; }
       .composer {
-        background: var(--panel-2); border: 1px solid var(--border);
-        border-radius: 22px; padding: 10px 12px 8px;
+        background: var(--panel); border: 1px solid var(--border);
+        border-radius: 16px; padding: 10px 12px 8px;
         display: flex; flex-direction: column; gap: 6px;
-        box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+        box-shadow: 0 4px 18px rgba(15, 23, 42, 0.08);
       }
       .composer:focus-within { border-color: var(--accent); }
       .composer textarea {
         width: 100%; resize: none; border: 0; outline: none; background: transparent;
-        color: var(--text); font-size: 16px; line-height: 1.5; font-family: inherit;
+        color: var(--text); font-size: 15px; line-height: 1.5; font-family: inherit;
         max-height: 200px; padding: 6px 8px 0;
       }
       .composer textarea::placeholder { color: var(--muted); }
@@ -89,22 +134,15 @@
       .composer-bar .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
       .composer-bar .model { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
       .composer select {
-        background: var(--panel); color: var(--text); border: 1px solid var(--border);
+        background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
         border-radius: 999px; padding: 6px 10px; font-size: 12px; cursor: pointer; outline: none;
       }
-      .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
-      .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-      .switch .track { width: 34px; height: 18px; border-radius: 999px; background: var(--border); transition: background 0.15s; position: relative; flex: none; }
-      .switch .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform 0.15s; }
-      .switch input:checked + .track { background: var(--guard); }
-      .switch input:checked + .track::after { transform: translateX(16px); }
-      .switch input:focus-visible + .track { box-shadow: 0 0 0 2px var(--accent); }
       .send {
-        width: 36px; height: 36px; border-radius: 50%; border: 0; cursor: pointer;
-        background: var(--accent); color: #fff; font-size: 17px; line-height: 1;
+        width: 34px; height: 34px; border-radius: 10px; border: 0; cursor: pointer;
+        background: var(--accent); color: #fff; font-size: 16px; line-height: 1;
         display: flex; align-items: center; justify-content: center;
       }
-      .send:disabled { opacity: 0.45; cursor: default; }
+      .send:disabled { opacity: 0.4; cursor: default; }
 
       .attach {
         width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border); cursor: pointer;
@@ -112,24 +150,24 @@
         display: flex; align-items: center; justify-content: center; flex: none;
       }
       .attach:hover { border-color: var(--accent); }
-      .composer.dragging { border-color: var(--accent); border-style: dashed; background: #17243a; }
+      .composer.dragging { border-color: var(--accent); border-style: dashed; background: var(--accent-soft); }
       .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 6px 0; }
       .chips:empty { display: none; }
       .chip {
         position: relative; display: flex; align-items: center; gap: 8px; max-width: 260px;
-        background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+        background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
         padding: 6px 28px 6px 6px; overflow: hidden; font-size: 12px;
       }
       .chip.error { border-color: var(--error); }
       .chip .thumb {
         width: 40px; height: 40px; border-radius: 8px; object-fit: cover; flex: none;
-        background: var(--panel-2); display: flex; align-items: center; justify-content: center; font-size: 20px;
+        background: var(--panel); display: flex; align-items: center; justify-content: center; font-size: 20px;
       }
       .chip .info { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
       .chip .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
       .chip .meta { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .chip.error .meta { color: #ff7b72; white-space: normal; }
-      .chip .badge { color: #f2cc60; }
+      .chip.error .meta { color: var(--error); white-space: normal; }
+      .chip .badge { color: var(--guard); }
       .chip .remove {
         position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border-radius: 50%;
         border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1;
@@ -143,26 +181,51 @@
       .bubble .files:last-child { margin-bottom: 0; }
       .bubble .files img { max-width: 180px; max-height: 140px; border-radius: 10px; display: block; }
       .bubble .files .doc {
-        background: rgba(255, 255, 255, 0.15); border-radius: 8px; padding: 6px 10px; font-size: 13px;
+        background: rgba(255, 255, 255, 0.2); border-radius: 8px; padding: 6px 10px; font-size: 13px;
       }
-      .notice.file { color: #9ecbff; border-color: var(--accent); }
+
+      /* Narrow screens: the sidebar becomes a top bar with a scrollable domain strip. */
+      @media (max-width: 760px) {
+        .app { flex-direction: column; }
+        .sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+        .brand { padding: 12px 16px; border-bottom: 0; }
+        .brand-sub, .side-head, .side-foot, #chats-section { display: none; }
+        .side-section { padding: 0 10px 10px; }
+        .domain-list { flex-direction: row; overflow-x: auto; }
+        .domain-item { width: auto; white-space: nowrap; }
+      }
     </style>
   </head>
   <body>
     <div class="app empty" id="app">
-      <div class="topbar">
-        <div class="brand">🛰️ Agent Chat <span>· vendor-agnostic observability demo</span></div>
-      </div>
-      <div class="body">
-        <div id="messages"></div>
-        <div class="hero">
-          <h1>Ready when you are.</h1>
-          <p>Ask the agent anything — choose a model below. Attach documents or pictures with 📎.</p>
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-name">Agent Chat</div>
+          <div class="brand-sub">Vendor-agnostic observability demo</div>
         </div>
-        <div class="composer-wrap">
+        <div class="side-section" id="domains-section">
+          <button class="side-head" type="button" aria-expanded="true">Domains <span class="chev">▾</span></button>
+          <nav class="side-body domain-list" id="domain-list" aria-label="Domain"></nav>
+        </div>
+        <div class="side-section" id="chats-section">
+          <button class="side-head" type="button" aria-expanded="true">Chats <span class="chev">▾</span></button>
+          <div class="side-body">
+            <button class="side-btn" id="new-chat" type="button" title="Start a new conversation">＋ New chat</button>
+          </div>
+        </div>
+        <div class="side-foot" id="domain-foot"></div>
+      </aside>
+      <main class="main">
+        <div id="messages"><div class="column" id="message-list"></div></div>
+        <div class="hero column">
+          <div class="pill" id="hero-domain"></div>
+          <h1>How can I help you?</h1>
+          <p id="hero-blurb">Ask the agent anything — choose a model below. Attach documents or pictures with 📎.</p>
+        </div>
+        <div class="composer-wrap column">
           <form class="composer" id="composer" autocomplete="off">
             <div class="chips" id="chips"></div>
-            <textarea id="input" rows="1" placeholder="Ask the agent… (attach files or images with 📎, drag-and-drop, or paste)"></textarea>
+            <textarea id="input" rows="1" placeholder="Ask anything… (attach files or images with 📎, drag-and-drop, or paste)"></textarea>
             <div class="composer-bar">
               <div class="controls">
                 <button class="attach" id="attach" type="button" title="Attach files or images">📎</button>
@@ -170,32 +233,45 @@
                 <label class="model">Model
                   <select id="provider"></select>
                 </label>
-                <label class="model">Domain
-                  <select id="domain"></select>
-                </label>
               </div>
               <button class="send" id="send" type="submit" title="Send">↑</button>
             </div>
           </form>
         </div>
-      </div>
+      </main>
     </div>
 
     <script>
       const appEl = document.getElementById("app");
       const messagesEl = document.getElementById("messages");
+      const messageList = document.getElementById("message-list");
       const form = document.getElementById("composer");
       const input = document.getElementById("input");
       const sendBtn = document.getElementById("send");
       const providerSel = document.getElementById("provider");
-      const domainSel = document.getElementById("domain");
+      const domainListEl = document.getElementById("domain-list");
+      const domainFootEl = document.getElementById("domain-foot");
+      const heroDomainEl = document.getElementById("hero-domain");
+      const heroBlurbEl = document.getElementById("hero-blurb");
       const chipsEl = document.getElementById("chips");
       const fileInput = document.getElementById("file-input");
       const attachBtn = document.getElementById("attach");
-      const conversationId = crypto.randomUUID
+      const newConversationId = () => crypto.randomUUID
         ? crypto.randomUUID()
         : `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      let conversationId = newConversationId();
 
+      // Light background tint + accent per domain; unknown domains get the default.
+      const DOMAIN_THEMES = {
+        ecomm: { tint: "#fff1c2", accent: "#9a6700", blurb: "Orders, delivery, assembly, returns, and spare parts for our home furnishings store." },
+        bank: { tint: "#e0ebfd", accent: "#1d4ed8", blurb: "Cards, statements, disputes, and customer account lookups." },
+        healthcare: { tint: "#dcf3e7", accent: "#047857", blurb: "Medication dosage, side effects, contraindications, and monitoring." },
+        insurance: { tint: "#ebe3fd", accent: "#6d28d9", blurb: "Auto claims, deductibles, rentals, and total-loss questions." },
+        restaurant: { tint: "#fde4d7", accent: "#c2410c", blurb: "Prep sequences, checklists, and shift operations for the kitchen." },
+      };
+      const DEFAULT_THEME = { tint: "#f1f4f8", accent: "#2563eb", blurb: "Ask the agent anything — choose a model below." };
+      let domains = [];
+      let currentDomain = null;
       const visionByProvider = {};
       let limits = { max_mb: 50, max_files: 4, accepted: { image: [], document: [] } };
       let pending = [];
@@ -366,8 +442,8 @@
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
       });
 
-      // Remember the last Model/Domain choice across reloads; when nothing is
-      // stored, fall back to a demo-friendly default, then the server default.
+      // Remember the last Model choice across reloads; when nothing is stored,
+      // fall back to a demo-friendly default, then the server default.
       function selectValue(sel, storageKey, preferred, serverDefault) {
         const saved = localStorage.getItem(storageKey);
         const exists = (v) => v && [...sel.options].some((o) => o.value === v);
@@ -375,7 +451,6 @@
         if (val) sel.value = val;
       }
       providerSel.addEventListener("change", () => { localStorage.setItem("ui.provider", providerSel.value); renderChips(); });
-      domainSel.addEventListener("change", () => localStorage.setItem("ui.domain", domainSel.value));
 
       async function loadProviders() {
         try {
@@ -395,21 +470,83 @@
         }
       }
 
+      const themeFor = (id) => DOMAIN_THEMES[id] || DEFAULT_THEME;
+
+      function applyDomainTheme(id) {
+        const theme = themeFor(id);
+        const root = document.documentElement.style;
+        root.setProperty("--tint", theme.tint);
+        root.setProperty("--accent", theme.accent);
+      }
+
+      function renderDomains() {
+        domainListEl.innerHTML = "";
+        for (const d of domains) {
+          const theme = themeFor(d.id);
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "domain-item";
+          btn.style.setProperty("--dot-tint", theme.tint);
+          btn.style.setProperty("--dot-accent", theme.accent);
+          btn.setAttribute("aria-current", String(d.id === currentDomain));
+          const dot = document.createElement("span");
+          dot.className = "dot";
+          btn.append(dot, document.createTextNode(d.label));
+          btn.addEventListener("click", () => selectDomain(d.id));
+          domainListEl.appendChild(btn);
+        }
+      }
+
+      function selectDomain(id) {
+        const domain = domains.find((d) => d.id === id);
+        if (!domain || id === currentDomain) return;
+        const switching = currentDomain !== null && !appEl.classList.contains("empty");
+        currentDomain = id;
+        localStorage.setItem("ui.domain", id);
+        applyDomainTheme(id);
+        renderDomains();
+        heroDomainEl.textContent = domain.label;
+        heroBlurbEl.textContent = themeFor(id).blurb;
+        domainFootEl.innerHTML = "";
+        domainFootEl.append("Galileo log stream · ");
+        const code = document.createElement("code");
+        code.textContent = id;
+        domainFootEl.appendChild(code);
+        document.title = `${domain.label} · Agent Chat`;
+        if (switching) addNotice("🔀 switched domain to " + domain.label);
+      }
+
       async function loadDomains() {
         try {
           const res = await fetch("/domains");
           const data = await res.json();
-          for (const d of data.domains) {
-            const opt = document.createElement("option");
-            opt.value = d.id;
-            opt.textContent = d.label;
-            domainSel.appendChild(opt);
-          }
-          selectValue(domainSel, "ui.domain", "bank", data.default);
+          domains = data.domains;
+          const saved = localStorage.getItem("ui.domain");
+          const exists = (v) => v && domains.some((d) => d.id === v);
+          selectDomain([saved, data.default, domains[0]?.id].find(exists));
         } catch (e) {
           console.error("could not load domains", e);
         }
       }
+
+      for (const head of document.querySelectorAll(".side-head")) {
+        head.addEventListener("click", () => {
+          const collapsed = head.parentElement.classList.toggle("collapsed");
+          head.setAttribute("aria-expanded", String(!collapsed));
+        });
+      }
+
+      document.getElementById("new-chat").addEventListener("click", () => {
+        if (busy) return;
+        for (const item of [...pending]) removeItem(item);
+        conversationId = newConversationId();
+        messageList.innerHTML = "";
+        appEl.classList.add("empty");
+        input.value = "";
+        autoGrow();
+        updateSend();
+        input.focus();
+      });
 
       function addMessage(role) {
         const wrap = document.createElement("div");
@@ -417,7 +554,7 @@
         const bubble = document.createElement("div");
         bubble.className = "bubble";
         wrap.appendChild(bubble);
-        messagesEl.appendChild(wrap);
+        messageList.appendChild(wrap);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return bubble;
       }
@@ -426,7 +563,7 @@
         const n = document.createElement("div");
         n.className = "notice " + (kind || "");
         n.textContent = text;
-        messagesEl.appendChild(n);
+        messageList.appendChild(n);
         messagesEl.scrollTop = messagesEl.scrollHeight;
       }
 
@@ -483,7 +620,7 @@
           body: JSON.stringify({
             message: text,
             provider: providerSel.value,
-            domain: domainSel.value,
+            domain: currentDomain,
             conversation_id: conversationId,
             attachments: items.map((i) => i.descriptor.id),
           }),

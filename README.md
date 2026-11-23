@@ -68,8 +68,9 @@ running.
 
 ## Demo prompts
 
-Use these for a consistent live demo. Pick the matching **Domain** in the UI
-dropdown first — each domain grounds retrieval on its own pgvector collection
+Use these for a consistent live demo. Pick the matching domain in the UI's left
+**Domains** sidebar first (the page re-tints to that domain's colour) — each
+domain grounds retrieval on its own pgvector collection
 (`ai_agent_demo_<domain>`). Domain questions fire the retrieval pre-hook (a
 `retrieve knowledge_base` retriever span), not a tool call. Arithmetic questions
 fire `calculator`; the **E-commerce** and **Bank** domains also have a
@@ -464,7 +465,7 @@ returns, spare parts, membership; the brand is never named), and `bank/`,
 `healthcare/`, `insurance/`, and `restaurant/` are reused from the golden demo. Each domain has `config.yaml`, `system_prompt.json`, `docs/qa.csv`,
 and generated Galileo upload artifacts.
 
-Each domain is also selectable in the chat UI (the **Domain** dropdown). Selecting
+Each domain is also selectable in the chat UI (the left **Domains** sidebar). Selecting
 a domain switches the agent's system prompt and grounds retrieval on that domain's
 own pgvector collection (`ai_agent_demo_<domain>`). Every domain is indexed into
 its collection at backend startup.
