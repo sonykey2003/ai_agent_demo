@@ -125,9 +125,10 @@ class Settings(BaseSettings):
     # separated). Listed domains trace via the Galileo SDK logger -- the deepest
     # Agent Control integration (rich control span + Controls tab). Every other
     # domain stays on the OTLP -> Collector -> Galileo path (the "adopt Galileo on
-    # your existing OTel" story). Empty = all domains on OTel. NOT named
-    # GALILEO_MODE -- that env var is reserved by the Galileo SDK (logger mode).
-    agent_control_native_domains: str = "bank"
+    # your existing OTel" story). Each native domain traces into the log stream
+    # named after it. Empty = all domains on OTel. NOT named GALILEO_MODE -- that
+    # env var is reserved by the Galileo SDK (logger mode).
+    agent_control_native_domains: str = "bank,ecomm"
     # When true, Agent Control emits its control spans over OTLP (the "otel"
     # observability sink) nested into the app's OTel trace -- so the typed control
     # span shows on the OTel path with no GalileoLogger. Overrides native domains.

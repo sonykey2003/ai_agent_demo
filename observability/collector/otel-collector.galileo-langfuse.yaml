@@ -50,12 +50,12 @@ exporters:
       project: ${env:GALILEO_PROJECT}
       logstream: restaurant
 
-  otlp_http/galileo_platform:
+  otlp_http/galileo_ecomm:
     traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
     headers:
       Galileo-API-Key: ${env:GALILEO_API_KEY}
       project: ${env:GALILEO_PROJECT}
-      logstream: platform
+      logstream: ecomm
 
   otlp_http/galileo_default:
     traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
@@ -100,10 +100,10 @@ exporters:
     tls:
       insecure_skip_verify: true
 
-  otlp_http/langfuse_platform:
+  otlp_http/langfuse_ecomm:
     endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
     headers:
-      Authorization: ${env:LANGFUSE_AUTH_PLATFORM}
+      Authorization: ${env:LANGFUSE_AUTH_ECOMM}
       x-langfuse-ingestion-version: "4"
     tls:
       insecure_skip_verify: true
@@ -145,8 +145,8 @@ connectors:
         condition: attributes["domain.name"] == "restaurant"
         pipelines: [traces/fanout_restaurant]
       - context: span
-        condition: attributes["domain.name"] == "platform"
-        pipelines: [traces/fanout_platform]
+        condition: attributes["domain.name"] == "ecomm"
+        pipelines: [traces/fanout_ecomm]
 
 service:
   pipelines:
@@ -168,9 +168,9 @@ service:
     traces/fanout_restaurant:
       receivers: [routing]
       exporters: [otlp_http/galileo_restaurant, otlp_http/langfuse_restaurant]
-    traces/fanout_platform:
+    traces/fanout_ecomm:
       receivers: [routing]
-      exporters: [otlp_http/galileo_platform, otlp_http/langfuse_platform]
+      exporters: [otlp_http/galileo_ecomm, otlp_http/langfuse_ecomm]
     traces/fanout_default:
       receivers: [routing]
       exporters: [otlp_http/galileo_default, otlp_http/langfuse_default]

@@ -51,12 +51,12 @@ exporters:
       project: ${env:GALILEO_PROJECT}
       logstream: restaurant
 
-  otlp_http/galileo_platform:
+  otlp_http/galileo_ecomm:
     traces_endpoint: ${env:GALILEO_OTEL_ENDPOINT}
     headers:
       Galileo-API-Key: ${env:GALILEO_API_KEY}
       project: ${env:GALILEO_PROJECT}
-      logstream: platform
+      logstream: ecomm
 
   # Fallback for traces with no domain.name (e.g. non-UI API clients): keeps the
   # original GALILEO_LOG_STREAM behaviour.
@@ -111,8 +111,8 @@ connectors:
         condition: attributes["domain.name"] == "restaurant"
         pipelines: [traces/galileo_restaurant]
       - context: span
-        condition: attributes["domain.name"] == "platform"
-        pipelines: [traces/galileo_platform]
+        condition: attributes["domain.name"] == "ecomm"
+        pipelines: [traces/galileo_ecomm]
 
 service:
   pipelines:
@@ -133,9 +133,9 @@ service:
     traces/galileo_restaurant:
       receivers: [routing]
       exporters: [otlp_http/galileo_restaurant]
-    traces/galileo_platform:
+    traces/galileo_ecomm:
       receivers: [routing]
-      exporters: [otlp_http/galileo_platform]
+      exporters: [otlp_http/galileo_ecomm]
     traces/galileo_default:
       receivers: [routing]
       exporters: [otlp_http/galileo_default]

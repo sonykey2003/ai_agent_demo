@@ -19,6 +19,7 @@ from ..config import get_settings
 from ..rag.vector_store import get_vector_store
 from .agent_control import ControlSteerError, ControlViolationError, control
 from .bank_db import query_customers
+from .ecomm_db import query_orders
 
 _tracer = trace.get_tracer("galileo_demo.retriever")
 log = logging.getLogger(__name__)
@@ -69,14 +70,19 @@ def calculator(expression: str) -> str:
         return f"error: {exc}"
 
 
-# Bank-only DB tool. The query runs as an Agent Control step ("query_customer_db")
-# so a control can govern it (e.g. block destructive SQL) exactly like the
-# getting-started-labs guardrails demo; it's a no-op passthrough when no control
-# is bound to that step. The .name/.tool_name marks it as a TOOL step so Agent
-# Control exposes the args as a dict (input.sql), not a flattened string.
+# Per-domain DB tools (bank: query_customer_db, ecomm: query_order_db). Each query
+# runs as its own Agent Control step so a control can govern it (e.g. block
+# destructive SQL, steer an unbounded SELECT) exactly like the getting-started-labs
+# guardrails demo; it's a no-op passthrough when no control is bound to that
+# step. The .name/.tool_name marks it as a TOOL step so Agent Control exposes the
+# args as a dict (input.sql), not a flattened string.
 query_customers.name = "query_customer_db"
 query_customers.tool_name = "query_customer_db"
 _query_customers_controlled = control(step_name="query_customer_db")(query_customers)
+
+query_orders.name = "query_order_db"
+query_orders.tool_name = "query_order_db"
+_query_orders_controlled = control(step_name="query_order_db")(query_orders)
 
 _ROW_CAP_RE = re.compile(r"\b(\d+)\b")
 _HAS_LIMIT_RE = re.compile(r"\blimit\b", re.IGNORECASE)
@@ -98,25 +104,14 @@ def _revised_sql(sql: str, guidance: str) -> str | None:
     return f"{statement} LIMIT {cap.group(1)}"
 
 
-@tool
-def query_customer_db(sql: str) -> str:
-    """Run a SQL statement against the bank database (policy-governed).
+def _run_governed_sql(controlled, sql: str) -> str:
+    """Run a control-wrapped SQL step and turn steer/deny into tool results.
 
-    Tables:
-      customers(id TEXT, name TEXT, email TEXT, account_type TEXT, balance REAL)
-        - account_type is one of 'Savings', 'Checking', 'Premier'.
-      transactions(id TEXT, account_id TEXT, txn_date TEXT, merchant TEXT,
-                   category TEXT, amount REAL)
-        - account_id joins customers.id; ~42 rows of card/account activity.
-    Reads use SELECT, e.g. SELECT merchant, amount FROM transactions WHERE category = 'Travel'.
-    Modification requests (DELETE / UPDATE) are passed through as written; a separate
-    query-layer policy decides whether they run. Returns JSON: {"success", "row_count", "data": [...]}.
-    If the policy steers the query the result is {"success": false, "revise_query", "rejected_sql",
-    "retry_with"} — call this tool once more with "retry_with" verbatim; never resend "rejected_sql".
+    Called with a keyword so Agent Control resolves the value at its "input.sql"
+    path.
     """
-    # Keyword so Agent Control resolves the value at its "input.sql" path.
     try:
-        return _query_customers_controlled(sql=sql)
+        return controlled(sql=sql)
     except ControlSteerError as exc:
         # Steer: return the guidance so the model revises the SQL and retries.
         guidance = str(getattr(exc, "steering_context", "") or exc)
@@ -135,6 +130,49 @@ def query_customer_db(sql: str) -> str:
         return json.dumps(
             {"success": False, "blocked_by_policy": str(exc), "data": []}
         )
+
+
+@tool
+def query_customer_db(sql: str) -> str:
+    """Run a SQL statement against the bank database (policy-governed).
+
+    Tables:
+      customers(id TEXT, name TEXT, email TEXT, account_type TEXT, balance REAL)
+        - account_type is one of 'Savings', 'Checking', 'Premier'.
+      transactions(id TEXT, account_id TEXT, txn_date TEXT, merchant TEXT,
+                   category TEXT, amount REAL)
+        - account_id joins customers.id; ~42 rows of card/account activity.
+    Reads use SELECT, e.g. SELECT merchant, amount FROM transactions WHERE category = 'Travel'.
+    Modification requests (DELETE / UPDATE) are passed through as written; a separate
+    query-layer policy decides whether they run. Returns JSON: {"success", "row_count", "data": [...]}.
+    If the policy steers the query the result is {"success": false, "revise_query", "rejected_sql",
+    "retry_with"} — call this tool once more with "retry_with" verbatim; never resend "rejected_sql".
+    """
+    return _run_governed_sql(_query_customers_controlled, sql)
+
+
+@tool
+def query_order_db(sql: str) -> str:
+    """Run a SQL statement against the store's order database (policy-governed).
+
+    Tables:
+      customers(id TEXT, name TEXT, email TEXT, phone TEXT, member_tier TEXT, city TEXT)
+        - id like 'C-2001'; member_tier is one of 'Guest', 'Home Club', 'Business'.
+      products(sku TEXT, name TEXT, category TEXT, price REAL, stock_qty INTEGER,
+               warehouse TEXT, assembly_required INTEGER)
+        - sku is the article number, e.g. '305.229.41'; stock_qty 0 = out of stock.
+      orders(id TEXT, customer_id TEXT, order_date TEXT, sku TEXT, quantity INTEGER,
+             amount REAL, status TEXT, fulfilment TEXT)
+        - id like 'O-10423'; customer_id joins customers.id; sku joins products.sku;
+          48 order lines. status: 'Processing', 'Shipped', 'Ready for pickup',
+          'Delivered', 'Returned'. fulfilment: 'Home delivery', 'Click & collect', 'Parcel'.
+    Reads use SELECT, e.g. SELECT name, stock_qty, warehouse FROM products WHERE name LIKE '%sofa%'.
+    Modification requests (DELETE / UPDATE) are passed through as written; a separate
+    query-layer policy decides whether they run. Returns JSON: {"success", "row_count", "data": [...]}.
+    If the policy steers the query the result is {"success": false, "revise_query", "rejected_sql",
+    "retry_with"} — call this tool once more with "retry_with" verbatim; never resend "rejected_sql".
+    """
+    return _run_governed_sql(_query_orders_controlled, sql)
 
 
 def _retrieve(query: str, k: int, collection: str | None) -> list[tuple[dict, float]]:
@@ -178,7 +216,7 @@ def retrieve_context(
     The collection is passed explicitly by the caller (bound to the selected domain
     at agent-build time); it falls back to the request-scoped contextvar. If no
     collection is bound, retrieval is skipped - it never silently queries the
-    default/platform collection.
+    default collection.
     """
     settings = get_settings()
     if not settings.rag_enabled:
@@ -313,9 +351,12 @@ def retrieve_context(
 
 
 TOOLS = [calculator]
-_BANK_TOOLS = [calculator, query_customer_db]
+_DOMAIN_TOOLS = {
+    "bank": [calculator, query_customer_db],
+    "ecomm": [calculator, query_order_db],
+}
 
 
 def tools_for_domain(domain: str | None) -> list:
-    """Bank gets the customer-DB tool; every other domain stays calculator-only."""
-    return _BANK_TOOLS if domain == "bank" else TOOLS
+    """Bank and ecomm get their governed DB tool; other domains stay calculator-only."""
+    return _DOMAIN_TOOLS.get(domain or "", TOOLS)

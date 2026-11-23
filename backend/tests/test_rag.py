@@ -23,8 +23,8 @@ def test_load_documents_and_stable_chunk_id(tmp_path: Path) -> None:
     assert ingest._chunk_id(documents[0]) == ingest._chunk_id(documents[0])
 
 
-def test_default_source_dir_contains_bundled_knowledge() -> None:
-    assert (ingest.default_source_dir() / "otel.md").is_file()
+def test_default_source_dir_is_default_domain_docs() -> None:
+    assert (ingest.default_source_dir() / "qa.csv").is_file()
 
 
 def test_lifespan_builds_rag_before_startup(monkeypatch) -> None:

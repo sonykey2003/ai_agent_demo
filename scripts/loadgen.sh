@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # Drive chat traffic at the backend so traces, logs and DB activity appear in the
-# configured backends. Bank is excluded by default: that domain runs the native
-# Galileo path with OTel muted, so it emits no spans.
+# configured backends. Bank and ecomm are excluded by default: those domains run
+# the native Galileo path (Agent Control native domains), so their OTel spans go
+# to Splunk APM only. Include them with DOMAINS="bank ecomm".
 #
 #   ./scripts/loadgen.sh                 # 5 rounds over the default domains
 #   ITERATIONS=20 ./scripts/loadgen.sh
@@ -10,7 +11,7 @@
 #   BASE_URL=http://localhost:8800 DELAY=5 ./scripts/loadgen.sh
 
 base_url="${BASE_URL:-http://localhost:8800}"
-domains="${DOMAINS:-healthcare insurance restaurant platform}"
+domains="${DOMAINS:-healthcare insurance restaurant}"
 iterations="${ITERATIONS:-5}"
 delay="${DELAY:-2}"
 
@@ -32,10 +33,14 @@ What are your opening hours on public holidays?" ;;
             echo "How do I dispute a card transaction?
 What is the daily transfer limit on my account?
 How long does an international wire take?" ;;
+        ecomm)
+            echo "Can I return a bookcase I have already assembled?
+Is the 3-seat fabric sofa in stock, and in which warehouse?
+I am missing a screw from my dresser, what should I do?" ;;
         *)
-            echo "How is this demo architected?
-Which observability backends are wired up?
-How does retrieval-augmented generation work here?" ;;
+            echo "What can you help me with?
+How do I contact customer support?
+What information do you need from me to get started?" ;;
     esac
 }
 

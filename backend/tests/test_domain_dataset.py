@@ -24,16 +24,7 @@ DOMAINS = _build_dataset.discover_domains()
 
 
 def test_domains_are_discovered() -> None:
-    assert {"platform", "bank", "healthcare", "insurance", "restaurant"} <= set(DOMAINS)
-
-
-def test_platform_system_prompt_matches_app() -> None:
-    from app.agent.graph import SYSTEM_PROMPT
-
-    prompt = json.loads(
-        (DOMAINS_DIR / "platform" / "system_prompt.json").read_text()
-    )["system_prompt"]
-    assert prompt == SYSTEM_PROMPT
+    assert {"ecomm", "bank", "healthcare", "insurance", "restaurant"} <= set(DOMAINS)
 
 
 @pytest.mark.parametrize("domain", DOMAINS)

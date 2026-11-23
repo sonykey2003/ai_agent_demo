@@ -158,7 +158,7 @@ def test_native_turn_sends_full_apm_only_trace_with_shared_id(monkeypatch) -> No
     monkeypatch.setattr(main, "get_settings", lambda: Settings(_env_file=None))
     monkeypatch.setattr(main, "agent_control_active", lambda: True)
     monkeypatch.setattr(main, "otel_sink_active", lambda: False)
-    monkeypatch.setattr(main, "get_ac_logger", lambda: fake_logger)
+    monkeypatch.setattr(main, "get_ac_logger", lambda domain: fake_logger)
     monkeypatch.setattr(main, "evaluate_user_input", passthrough)
     monkeypatch.setattr(main, "_resolve_output_control", no_output_control)
     monkeypatch.setattr(main, "build_agent", lambda **kwargs: FakeAgent())

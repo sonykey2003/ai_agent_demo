@@ -1,9 +1,9 @@
 """Runtime registry of knowledge domains selectable from the UI.
 
-Each domain maps to its own pgvector collection and (optionally) its own system
-prompt. ``platform`` is the demo's own knowledge (``backend/knowledge`` -> the
-default collection); the others are reused from the golden demo and ground on
-their ``docs/qa.csv``.
+Each domain maps to its own pgvector collection (``ai_agent_demo_<domain>``) and
+(optionally) its own system prompt, and grounds on its ``docs/`` (``qa.csv``).
+``ecomm`` (online home furnishings store) is the default; ``bank``,
+``healthcare``, ``insurance``, and ``restaurant`` are reused from the golden demo.
 """
 
 from __future__ import annotations
@@ -13,9 +13,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from .config import get_settings
+DEFAULT_DOMAIN = "ecomm"
 
-DEFAULT_DOMAIN = "platform"
+# Display labels that title-casing the directory name would get wrong.
+_LABELS = {"ecomm": "E-commerce"}
 
 
 @dataclass(frozen=True)
@@ -25,11 +26,6 @@ class Domain:
     collection: str
     docs_dir: Path
     system_prompt: str | None
-
-
-def knowledge_dir() -> Path:
-    """Return the platform knowledge directory (backend/knowledge)."""
-    return Path(__file__).resolve().parents[1] / "knowledge"
 
 
 def domains_root() -> Path:
@@ -44,7 +40,6 @@ def domains_root() -> Path:
 
 @lru_cache(maxsize=1)
 def get_domains() -> dict[str, "Domain"]:
-    settings = get_settings()
     root = domains_root()
     domains: dict[str, Domain] = {}
     if not root.is_dir():
@@ -59,17 +54,11 @@ def get_domains() -> dict[str, "Domain"]:
             system_prompt = json.loads(prompt_file.read_text(encoding="utf-8")).get(
                 "system_prompt"
             )
-        if name == DEFAULT_DOMAIN:
-            collection = settings.rag_collection
-            docs_dir = knowledge_dir()
-        else:
-            collection = f"ai_agent_demo_{name}"
-            docs_dir = path / "docs"
         domains[name] = Domain(
             name=name,
-            label=name.replace("-", " ").title(),
-            collection=collection,
-            docs_dir=docs_dir,
+            label=_LABELS.get(name, name.replace("-", " ").title()),
+            collection=f"ai_agent_demo_{name}",
+            docs_dir=path / "docs",
             system_prompt=system_prompt,
         )
     return domains

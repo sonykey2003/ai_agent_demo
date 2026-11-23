@@ -10,9 +10,9 @@ Usage:
     # .env must contain GALILEO_API_KEY and GALILEO_PROJECT (and, for --baseline,
     # a reachable model provider). GALILEO_CONSOLE_URL is derived from
     # GALILEO_OTEL_ENDPOINT when unset.
-    python eval/upload_galileo_dataset.py --domain platform             # upload dataset
-    python eval/upload_galileo_dataset.py --domain platform --preview   # show, don't upload
-    python eval/upload_galileo_dataset.py --domain platform --baseline --provider local
+    python eval/upload_galileo_dataset.py --domain ecomm             # upload dataset
+    python eval/upload_galileo_dataset.py --domain ecomm --preview   # show, don't upload
+    python eval/upload_galileo_dataset.py --domain ecomm --baseline --provider local
 """
 
 from __future__ import annotations
@@ -78,12 +78,16 @@ def _baseline_metrics() -> list:
     return [getattr(GalileoScorers, name) for name in wanted if hasattr(GalileoScorers, name)]
 
 
-def _make_experiment_function(provider: str | None):
-    """Build the app agent once and return a callable Galileo can score."""
+def _make_experiment_function(provider: str | None, domain: str):
+    """Build the domain's app agent once and return a callable Galileo can score.
+
+    The domain binds the system prompt and the pgvector collection retrieval
+    grounds on (indexed at backend startup or via ``app.rag.ingest --domain``).
+    """
     sys.path.insert(0, str(REPO_ROOT / "backend"))
     from app.agent.graph import build_agent  # noqa: PLC0415
 
-    agent = build_agent(provider=provider)
+    agent = build_agent(provider=provider, domain=domain)
 
     def run_case(row) -> str:
         user_input = row["input"] if isinstance(row, dict) else str(row)
@@ -98,7 +102,7 @@ def _make_experiment_function(provider: str | None):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--domain", default="platform")
+    parser.add_argument("--domain", default="ecomm")
     parser.add_argument("--preview", action="store_true", help="Show rows without uploading.")
     parser.add_argument(
         "--baseline",
@@ -167,7 +171,7 @@ def main() -> int:
     results = run_experiment(
         f"{args.domain}-baseline",
         dataset=dataset,
-        function=_make_experiment_function(args.provider),
+        function=_make_experiment_function(args.provider, args.domain),
         metrics=metrics,
         project=project,
     )

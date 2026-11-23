@@ -10,7 +10,6 @@ RUN pip install --no-cache-dir -U pip \
     && pip install --no-cache-dir -r /tmp/build/requirements.txt
 
 COPY backend/app ./app
-COPY backend/knowledge ./knowledge
 COPY domains ./domains
 
 EXPOSE 8000

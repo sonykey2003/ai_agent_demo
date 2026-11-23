@@ -66,16 +66,16 @@ exporters:
     tls:
       insecure_skip_verify: true
 
-  otlp_http/langfuse_platform:
+  otlp_http/langfuse_ecomm:
     endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
     headers:
-      Authorization: ${env:LANGFUSE_AUTH_PLATFORM}
+      Authorization: ${env:LANGFUSE_AUTH_ECOMM}
       x-langfuse-ingestion-version: "4"
     tls:
       insecure_skip_verify: true
 
   # Fallback for traces with no domain.name (e.g. non-UI API clients): reuses the
-  # platform project key by default (override with LANGFUSE_AUTH_DEFAULT in .env).
+  # ecomm project key by default (override with LANGFUSE_AUTH_DEFAULT in .env).
   otlp_http/langfuse_default:
     endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
     headers:
@@ -116,8 +116,8 @@ connectors:
         condition: attributes["domain.name"] == "restaurant"
         pipelines: [traces/langfuse_restaurant]
       - context: span
-        condition: attributes["domain.name"] == "platform"
-        pipelines: [traces/langfuse_platform]
+        condition: attributes["domain.name"] == "ecomm"
+        pipelines: [traces/langfuse_ecomm]
 
 service:
   pipelines:
@@ -138,9 +138,9 @@ service:
     traces/langfuse_restaurant:
       receivers: [routing]
       exporters: [otlp_http/langfuse_restaurant]
-    traces/langfuse_platform:
+    traces/langfuse_ecomm:
       receivers: [routing]
-      exporters: [otlp_http/langfuse_platform]
+      exporters: [otlp_http/langfuse_ecomm]
     traces/langfuse_default:
       receivers: [routing]
       exporters: [otlp_http/langfuse_default]

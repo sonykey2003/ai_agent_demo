@@ -28,8 +28,8 @@ The chat endpoint and embedding endpoint are intentionally separate:
 - `OLLAMA_EMBEDDING_BASE_URL=http://localhost:11434` uses Ollama's native API.
 
 RAG ingestion is a critical backend startup step. When `RAG_ENABLED=true`, the
-backend rebuilds the collection from the bundled knowledge files before FastAPI
-becomes ready. Startup fails if PostgreSQL, Ollama embeddings, or ingestion is
+backend rebuilds every domain's collection from its `domains/<domain>/docs`
+before FastAPI becomes ready. Startup fails if PostgreSQL, Ollama embeddings, or ingestion is
 unavailable, so the app cannot silently run without grounding.
 
 For a host-run backend, start pgvector and then start FastAPI normally:
@@ -43,9 +43,9 @@ TELEMETRY_ENABLED=false .venv/bin/python -m uvicorn app.main:app \
 ```
 
 The app's database is exposed on `localhost:5433`, avoiding the golden demo's
-PostgreSQL port `5432`. Add or edit Markdown/text files under
-`backend/knowledge`, then restart the backend to rebuild the collection. Chunk
-IDs are deterministic and citations use readable IDs such as `[otel-0]`.
+PostgreSQL port `5432`. Add or edit `qa.csv` (or Markdown/text files) under
+`domains/<domain>/docs`, then restart the backend to rebuild the collections.
+Chunk IDs are deterministic and citations use readable IDs such as `[qa-0]`.
 
 For a complete Compose deployment, first make sure Ollama is running on the
 host and already contains the required models. Compose connects to the host at
@@ -72,15 +72,19 @@ Use these for a consistent live demo. Pick the matching **Domain** in the UI
 dropdown first — each domain grounds retrieval on its own pgvector collection
 (`ai_agent_demo_<domain>`). Domain questions fire the retrieval pre-hook (a
 `retrieve knowledge_base` retriever span), not a tool call. Arithmetic questions
-fire the only real LLM tool, `calculator`.
+fire `calculator`; the **E-commerce** and **Bank** domains also have a
+policy-governed SQL tool (`query_order_db` / `query_customer_db`) that runs as a
+Galileo Agent Control step.
 
 ### Knowledge / RAG prompts (per domain)
 
-**Platform** (`ai_agent_demo_knowledge`, grounded in `backend/knowledge`):
+**E-commerce** (online home furnishings store — the default domain):
 
-- What OpenTelemetry GenAI semantic conventions does this app emit?
-- How does the retriever span get evaluated by Galileo RAG metrics?
-- Which LLM providers are supported and how do I switch between them?
+- Can I return furniture I have already assembled?
+- I am missing a screw from my dresser, what should I do?
+- How much does home delivery cost, and is assembly available?
+- Is the 3-seat fabric sofa in stock, and in which warehouse? *(SQL tool)*
+- What's the status of order O-10423? *(SQL tool)*
 
 **Bank** (credit-card call center):
 
@@ -136,7 +140,7 @@ kubectl apply -f deploy/k8s/backend.yaml
 ```
 
 Create `deploy/k8s/secrets.yaml` from the example before deployment. Restart the
-backend deployment after changing bundled knowledge to rebuild the collection.
+backend deployment after changing domain knowledge to rebuild the collections.
 
 ## Attachments (files & pictures)
 
@@ -184,6 +188,7 @@ Demo prompts:
 
 - **Bank** · attach a receipt photo → "What is the total and which card was used?"
 - **Bank** · attach a scanned statement PDF → "Which charge looks suspicious?"
+- **E-commerce** · attach a photo of a damaged delivery → "What should I do about this, and what's my order status for O-10423?"
 - **Restaurant** · attach a Chinese supplier invoice photo → "What did we order and what's the total?"
 - Switch to the OpenRouter model and repeat with the receipt to show the
   recognized-text-only path.
@@ -218,8 +223,9 @@ Galileo trace ID : 45de319b-7942-4201-b365-e8e5a347eaeb
 Splunk APM ID    : 45de319b79424201b365e8e5a347eaeb   (same, without dashes)
 ```
 
-Turns on the native Galileo path (Agent Control native domains, `bank` by
-default) build their Galileo trace with the native logger instead. Every OTel
+Turns on the native Galileo path (Agent Control native domains, `bank` and
+`ecomm` by default) build their Galileo trace with the native logger instead,
+one logger per domain writing to the log stream named after it. Every OTel
 span of such a turn (entry, retrieval/Postgres, LLM, tools) is stamped
 `telemetry.apm_only=true`, so Splunk APM gets the full tree, including the
 inferred database and LLM services, while the Collector keeps those spans out of
@@ -341,7 +347,7 @@ the Observations view / Observations API v2 — the legacy `/api/public/traces`
 endpoint is retired.
 
 With `otel-collector.galileo-langfuse.yaml` every trace goes to Galileo **and**
-Langfuse at once (verified: one chat lands in the Galileo `platform` log stream
+Langfuse at once (verified: one chat lands in the domain's Galileo log stream
 and the Langfuse project simultaneously) — ideal for a side-by-side comparison.
 The single-backend configs keep them mutually exclusive. Switch back to
 Galileo-only by setting `OTEL_COLLECTOR_CONFIG=otel-collector.galileo.yaml` and
@@ -393,9 +399,9 @@ ITERATIONS=20 DELAY=5 ./scripts/loadgen.sh
 DOMAINS="healthcare insurance" ./scripts/loadgen.sh
 ```
 
-Bank is excluded by default: that domain runs the native Galileo path (its
-Galileo trace comes from the native logger; its OTel spans go to APM only).
-Override with `DOMAINS="bank"` to include it.
+Bank and ecomm are excluded by default: those domains run the native Galileo
+path (their Galileo trace comes from the native logger; their OTel spans go to
+APM only). Override with `DOMAINS="bank ecomm"` to include them.
 
 ## Agent Control (optional runtime guardrail)
 
@@ -422,24 +428,49 @@ and rebuild the backend (`docker compose up -d --build backend`). At startup the
 log shows `Agent Control initialised (agent=..., log_stream_id=...)`. If the SDK
 or `AGENT_CONTROL_URL` is missing, controls stay off and the app runs normally.
 
+### Governed SQL tools (bank, ecomm)
+
+`bank` and `ecomm` each expose a real SQLite tool wrapped as its own Agent
+Control step (`agent/tools.py`):
+
+| Domain | Tool / step name | Tables |
+|---|---|---|
+| `bank` | `query_customer_db` | `customers` (PII), `transactions` (PII-free ledger, 42 rows) |
+| `ecomm` | `query_order_db` | `customers` (PII), `orders` (PII-free ledger, 48 rows), `products` |
+
+The tool runs whatever SQL the model writes — there is no allow-list in the app,
+and the database re-seeds before every call — so only a control decides. A
+*steer* returns the control's guidance plus a `retry_with` statement (e.g. the
+same `SELECT` with the control's `LIMIT`), and the agent retries once; a *deny*
+returns `blocked_by_policy`.
+
+Controls are fetched for one target (`AGENT_CONTROL_LOG_STREAM`) and govern
+every domain. A control whose **Step names** list only `query_customer_db` does
+not see ecomm's tool — add `query_order_db` to its step names (or use a step
+name regex such as `^query_(customer|order)_db$`) to govern both.
+
+Each native domain gets its own Galileo logger, so its traces (with the bridged
+control spans) land in its own log stream (`bank`, `ecomm`), while the controls
+stay bound to `AGENT_CONTROL_LOG_STREAM`. Set `AGENT_CONTROL_NATIVE_DOMAINS` to
+change which domains run natively.
+
 A standalone, non-embedded version also lives in `eval/agent_control_demo.py`.
 
 ## Domain datasets (Galileo eval + coherence baselining)
 
 `domains/` packages evaluation datasets like the golden demo's `domains/` layout.
-`platform/` is the demo's own subject matter (grounded in `backend/knowledge`),
-and `bank/`, `healthcare/`, `insurance/`, and `restaurant/` are reused from the
-golden demo. Each domain has `config.yaml`, `system_prompt.json`, `docs/qa.csv`,
+`ecomm/` is an online home furnishings store (orders, delivery, assembly,
+returns, spare parts, membership; the brand is never named), and `bank/`,
+`healthcare/`, `insurance/`, and `restaurant/` are reused from the golden demo. Each domain has `config.yaml`, `system_prompt.json`, `docs/qa.csv`,
 and generated Galileo upload artifacts.
 
 Each domain is also selectable in the chat UI (the **Domain** dropdown). Selecting
 a domain switches the agent's system prompt and grounds retrieval on that domain's
-own pgvector collection (`ai_agent_demo_<domain>`, or `ai_agent_demo_knowledge`
-for `platform`). Every domain is indexed into its collection at backend startup.
+own pgvector collection (`ai_agent_demo_<domain>`). Every domain is indexed into
+its collection at backend startup.
 
 Regenerate the datasets after editing any `docs/qa.csv` (each answer is checked
-for grounding — `platform` against `backend/knowledge`, reused domains against
-their own `docs/`):
+for grounding against the domain's own `docs/`):
 
 ```bash
 python eval/build_dataset.py --all --check
@@ -461,10 +492,9 @@ python eval/upload_galileo_dataset.py --domain bank --baseline  # upload + score
 The baseline scores `context_adherence`, `ground_truth_adherence`,
 `chunk_attribution_utilization`, and `completeness` where available. Register the
 NIM-judged variants first with `eval/configure_galileo_metrics.py` if you don't
-have an OpenAI integration. The `--baseline` runner uses the app agent, which is
-grounded on `backend/knowledge`; to baseline a reused domain against its own
-knowledge, ingest that domain's docs into pgvector first
-(`python -m app.rag.ingest --reset domains/<domain>/docs`).
+have an OpenAI integration. The `--baseline` runner uses the app agent for the
+selected domain, grounded on that domain's collection; when running outside the
+stack, ingest it first (`python -m app.rag.ingest --domain <domain>`).
 
 ## Pre-prod experiments (LLM & guardrails)
 

@@ -48,7 +48,11 @@ except Exception:  # noqa: BLE001
 # is available. The decorated step functions below bind against this.
 _ENABLED = bool(get_settings().agent_control_enabled) and _ac is not None
 _initialized = False
-_logger = None  # native GalileoLogger that owns Agent Control turn traces
+# Native GalileoLoggers that own Agent Control turn traces, one per native domain,
+# each writing to the log stream named after its domain (bank -> "bank", ecomm ->
+# "ecomm"). The Galileo bridge routes each control span to whichever logger owns
+# the active trace, so domains share one Agent Control session but not a stream.
+_loggers: dict = {}
 _otel_sink = False  # True when control spans are emitted over OTLP (otel sink)
 
 
@@ -68,9 +72,12 @@ def is_active() -> bool:
     return _ENABLED and _initialized
 
 
-def get_ac_logger():
-    """Native Galileo logger that owns Agent Control turn traces (or None)."""
-    return _logger if is_active() else None
+def get_ac_logger(domain: str | None):
+    """Native Galileo logger that owns this domain's Agent Control turn traces.
+
+    None when controls are off or the domain is not on the native path.
+    """
+    return _loggers.get(domain) if is_active() and domain else None
 
 
 def otel_sink_active() -> bool:
@@ -100,9 +107,10 @@ def unbind_otel_trace_context() -> None:
 def setup_agent_control() -> bool:
     """Initialize Agent Control against the configured Galileo log stream.
 
-    Resolves the log stream ID with a short-lived Galileo logger, then points the
-    Agent Control SDK at it. Best-effort: any failure logs and leaves controls off
-    so the app keeps serving.
+    Resolves the controls' log stream ID with a Galileo logger and points the
+    Agent Control SDK at it (one SDK session = one control target). Each native
+    domain then gets its own bridged logger for its own log stream. Best-effort:
+    any failure logs and leaves controls off so the app keeps serving.
     """
     global _initialized
     if not _ENABLED or _initialized:
@@ -160,10 +168,27 @@ def setup_agent_control() -> bool:
         # breakdown) to an active logger trace; OTel-domain turns have no active
         # logger trace, so their control step is the app's OTel guardrail span.
         otel_sink = settings.agent_control_otel_sink
-        native = bool(settings.native_domains()) and not otel_sink
-        if native:
-            logger.enable_agent_control()
-            logger.start_session(name=settings.agent_control_agent_name)
+        native_domains = set() if otel_sink else settings.native_domains()
+        native = bool(native_domains)
+        loggers = {}
+        for name in sorted(native_domains):
+            try:
+                domain_logger = (
+                    logger
+                    if name == ac_log_stream
+                    else GalileoLogger(
+                        project=settings.galileo_project, log_stream=name
+                    )
+                )
+                domain_logger.enable_agent_control()
+                domain_logger.start_session(name=settings.agent_control_agent_name)
+                loggers[name] = domain_logger
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "Native Galileo logger for domain %s failed; it falls back "
+                    "to the OTel path.",
+                    name,
+                )
 
         init_kwargs = dict(
             agent_name=settings.agent_control_agent_name,
@@ -192,8 +217,9 @@ def setup_agent_control() -> bool:
         elif native:
             init_kwargs["observability_sink_name"] = "registered"
         _ac.init(**init_kwargs)
-        global _logger, _otel_sink
-        _logger = logger
+        global _otel_sink
+        _loggers.clear()
+        _loggers.update(loggers)
         _otel_sink = otel_sink
         _initialized = True
         try:
@@ -201,11 +227,13 @@ def setup_agent_control() -> bool:
         except Exception:  # noqa: BLE001
             n = -1
         log.info(
-            "Agent Control initialised (agent=%s, log_stream=%s, log_stream_id=%s, controls=%d)",
+            "Agent Control initialised (agent=%s, log_stream=%s, log_stream_id=%s, "
+            "controls=%d, native_domains=%s)",
             settings.agent_control_agent_name,
             ac_log_stream,
             logger.log_stream_id,
             n,
+            ",".join(sorted(loggers)) or "-",
         )
     except Exception:  # noqa: BLE001
         log.exception("Agent Control init failed; continuing without controls.")

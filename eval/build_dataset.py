@@ -6,13 +6,13 @@ upload artifacts next to it:
   - ``domains/<domain>/dataset.csv``   -> ``input,output`` for the Galileo UI upload
   - ``domains/<domain>/dataset.jsonl`` -> ``{input, output, metadata}`` for the SDK
 
-Each answer is checked for grounding against the knowledge file named in its
-``source`` column, so the reference outputs stay faithful for context-adherence
-and coherence baselining.
+Each answer is checked for grounding against the domain's own ``docs/`` (or the
+file named in its optional ``source`` column), so the reference outputs stay
+faithful for context-adherence and coherence baselining.
 
 Usage:
-    python eval/build_dataset.py                      # domain defaults to "platform"
-    python eval/build_dataset.py --domain platform    # regenerate after editing qa.csv
+    python eval/build_dataset.py                      # domain defaults to "ecomm"
+    python eval/build_dataset.py --domain ecomm       # regenerate after editing qa.csv
     python eval/build_dataset.py --check              # fail if any answer looks ungrounded
 """
 
@@ -25,7 +25,6 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIR = REPO_ROOT / "backend" / "knowledge"
 
 # Common words carry no grounding signal; drop them before measuring overlap.
 _STOPWORDS = {
@@ -69,9 +68,8 @@ def grounding_warnings(rows: list[dict], domain_dir: Path) -> list[str]:
     """Return a warning per answer that is weakly supported by its knowledge.
 
     Rows with a ``source`` column are grounded against that named file under
-    ``backend/knowledge`` (the platform domain). Rows without a source are
-    self-grounded against the domain's own ``docs/`` corpus (the reused golden
-    domains, whose knowledge is the qa.csv itself).
+    the domain's ``docs/``. Rows without a source are self-grounded against the
+    domain's whole ``docs/`` corpus (whose knowledge is the qa.csv itself).
     """
     warnings: list[str] = []
     has_source = any(row["source"] for row in rows)
@@ -84,9 +82,9 @@ def grounding_warnings(rows: list[dict], domain_dir: Path) -> list[str]:
                 warnings.append(f"row {i}: only {overlap:.0%} of answer terms appear in docs/")
             continue
         source = row["source"]
-        path = KNOWLEDGE_DIR / source
+        path = domain_dir / "docs" / source
         if not path.is_file():
-            warnings.append(f"row {i}: source '{source}' not found under {KNOWLEDGE_DIR}")
+            warnings.append(f"row {i}: source '{source}' not found under {path.parent}")
             continue
         doc_tokens = _tokens(path.read_text(encoding="utf-8"))
         overlap = len(answer_tokens & doc_tokens) / max(len(answer_tokens), 1)
@@ -150,7 +148,7 @@ def discover_domains() -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--domain", default="platform")
+    parser.add_argument("--domain", default="ecomm")
     parser.add_argument("--all", action="store_true", help="Build every domain.")
     parser.add_argument(
         "--check",

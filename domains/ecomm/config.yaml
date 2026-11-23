@@ -1,0 +1,42 @@
+# E-commerce domain: customer support for an online home furnishings store
+# (flat-pack furniture, delivery, assembly, returns, spare parts). The brand is
+# deliberately unnamed in every prompt, document, and dataset row.
+#
+# Like `bank`, this domain exposes a real (SQLite, re-seeded per call) database
+# tool, `query_order_db`, that runs as a Galileo Agent Control step, and it
+# traces via the native Galileo logger by default (AGENT_CONTROL_NATIVE_DOMAINS).
+# Knowledge lives in docs/qa.csv; datasets here are for Galileo eval and
+# context-adherence / coherence baselining.
+
+domain:
+  name: "ecomm"
+  description: >-
+    Customer support assistant for an online home furnishings store: orders,
+    delivery, click & collect, assembly, returns, spare parts, and the member
+    programme, plus a policy-governed order database.
+
+galileo:
+  project: "shawn-otel-demo"
+  log_stream: "ecomm"
+
+model:
+  default_provider: "local"
+  temperature: 0.1
+
+rag:
+  enabled: true
+  knowledge_dir: "domains/ecomm/docs"
+  chunk_size: 1000
+  chunk_overlap: 200
+  top_k: 3
+
+vectorstore:
+  embedding_model: "nomic-embed-text"
+  collection: "ai_agent_demo_ecomm"
+
+dataset:
+  qa: "domains/ecomm/docs/qa.csv"
+  csv: "domains/ecomm/dataset.csv"
+  jsonl: "domains/ecomm/dataset.jsonl"
+  input_column: "input"
+  output_column: "output"

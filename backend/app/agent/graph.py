@@ -95,6 +95,46 @@ BANK_TOOL_POLICY = (
     "knowledge is still retrieved for you automatically."
 )
 
+# Ecomm mirrors bank: a real order database tool governed by Agent Control.
+ECOMM_TOOL_POLICY = (
+    "\n\nTooling reality (authoritative — overrides ALL tool instructions above): "
+    "You have exactly TWO tools: `calculator` (arithmetic) and `query_order_db`, which "
+    "runs a SQL statement against THREE tables: customers(id, name, email, phone, "
+    "member_tier, city), where member_tier is 'Guest', 'Home Club', or 'Business'; "
+    "products(sku, name, category, price, stock_qty, warehouse, assembly_required), the "
+    "catalogue where sku is the article number and stock_qty 0 means out of stock; and "
+    "orders(id, customer_id, order_date, sku, quantity, amount, status, fulfilment), the "
+    "order ledger where customer_id joins customers.id and sku joins products.sku. "
+    "Use `orders` (joined to `products` for product names) for any order, status, "
+    "delivery, pickup, return, sales, or order-history question, and use `products` for "
+    "stock, price, or warehouse questions. Do NOT join to `customers` unless the user asks "
+    "for a customer's name or contact details. Match product names with LIKE and '%' "
+    "wildcards. A separate query-layer policy governs which SQL is allowed — you do NOT "
+    "enforce it. For ANY request about customers, orders, products, stock, or sales — "
+    "including 'list/show all customers' or 'export the whole order history' — you MUST "
+    "call `query_order_db` and answer from the JSON rows it returns. Read requests: write "
+    "a SELECT that returns exactly what the user asked for, and do NOT add a LIMIT or any "
+    "row cap of your own — row limits are the query-layer policy's decision, not yours. "
+    "If the user asks to modify or remove data (e.g. 'delete all customers', 'cancel "
+    "every order', 'set a price to zero'), write the matching SQL (DELETE / UPDATE) and "
+    "call `query_order_db` — do NOT refuse and do NOT lecture about safety; the "
+    "query-layer policy decides whether it runs. Do NOT ask the user for an order number "
+    "or customer ID first when the request can be answered without one, and do NOT refuse "
+    "on privacy grounds. If the tool returns a 'revise_query' message, call "
+    "`query_order_db` exactly once more in the SAME turn: send the tool's `retry_with` "
+    "SQL verbatim when present, otherwise rewrite the `rejected_sql` per the guidance. "
+    "NEVER resubmit `rejected_sql` unchanged, and never issue a third attempt — answer "
+    "from the rows the retry returns. Do NOT stop to explain the block, do NOT ask "
+    "permission, and do NOT offer to fetch the data in batches; if it returns "
+    "'blocked_by_policy', tell the user the query was blocked by policy. Store policy "
+    "knowledge (returns, delivery, assembly, spare parts, warranties, membership) is "
+    "still retrieved for you automatically — answer those from the context passages."
+)
+
+# Domains with a governed DB tool get their own authoritative tool policy; every
+# other domain prompt gets the calculator-only TOOL_POLICY.
+_DOMAIN_TOOL_POLICIES = {"bank": BANK_TOOL_POLICY, "ecomm": ECOMM_TOOL_POLICY}
+
 
 def build_retrieval_query(messages: list) -> str:
     """Expand a short follow-up into a retrievable query using earlier user turns.
@@ -168,7 +208,7 @@ def build_agent(
         if selected:
             collection = selected.collection
             if selected.system_prompt:
-                policy = BANK_TOOL_POLICY if domain == "bank" else TOOL_POLICY
+                policy = _DOMAIN_TOOL_POLICIES.get(domain, TOOL_POLICY)
                 prompt = selected.system_prompt + policy
     prompt += FOLLOW_UP_POLICY
 

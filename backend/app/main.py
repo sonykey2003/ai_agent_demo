@@ -497,7 +497,7 @@ async def _agent_control_stream(
     OTel spans of the turn reach Splunk APM but not Galileo, and the logger owns
     the one Galileo trace. ``apm_span`` is the OTel turn span.
     """
-    logger = get_ac_logger()
+    logger = get_ac_logger(domain.name)
     yield _sse(
         {"type": "meta", "domain": domain.name, "collection": domain.collection}
     )
@@ -775,13 +775,15 @@ async def _event_stream(req: ChatRequest):
             )
 
     # Per-domain tracing: native Galileo SDK for the configured domains (deepest
-    # Agent Control integration -- rich control span + Controls tab); every other
-    # domain stays on the OTLP -> Collector -> Galileo path (OTel adoption story).
-    # When the OTel control sink is active, all domains stay on the OTel path.
+    # Agent Control integration -- rich control span + Controls tab), each into its
+    # own log stream; every other domain stays on the OTLP -> Collector -> Galileo
+    # path (OTel adoption story). When the OTel control sink is active, all domains
+    # stay on the OTel path.
     if (
         agent_control_active()
         and not otel_sink_active()
         and domain.name in settings.native_domains()
+        and get_ac_logger(domain.name) is not None
     ):
         # The native logger owns this turn's Galileo trace. Every OTel span of the
         # turn (entry, retrieval/DB, LLM, tools) is marked APM-only, so Splunk APM

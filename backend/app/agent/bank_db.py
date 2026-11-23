@@ -8,13 +8,12 @@ be demoed without an output-PII control withholding the answer). Fake data only.
 
 from __future__ import annotations
 
-import json
 import sqlite3
-import threading
 from pathlib import Path
 
+from .demo_db import run_on_fresh_db
+
 _DB_PATH = Path("/tmp/bank_customers.db")
-_lock = threading.Lock()
 
 # (id, name, email, account_type, balance) — fabricated demo data only.
 _CUSTOMERS = [
@@ -58,50 +57,40 @@ def _seed_transactions() -> list[tuple[str, str, str, str, str, float]]:
     return rows
 
 
-def _seed_db() -> None:
-    """Re-seed from scratch before every query.
-
-    The tool executes whatever SQL it is given -- Galileo Agent Control is the
-    only thing that may refuse a statement -- so a destructive query really does
-    mutate the demo tables. Re-seeding per call lets the next turn start clean.
-    """
-    conn = sqlite3.connect(_DB_PATH)
-    try:
-        conn.executescript(
-            """
-            DROP TABLE IF EXISTS customers;
-            CREATE TABLE customers (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL,
-                account_type TEXT NOT NULL,
-                balance REAL NOT NULL
-            );
-            DROP TABLE IF EXISTS transactions;
-            CREATE TABLE transactions (
-                id TEXT PRIMARY KEY,
-                account_id TEXT NOT NULL,
-                txn_date TEXT NOT NULL,
-                merchant TEXT NOT NULL,
-                category TEXT NOT NULL,
-                amount REAL NOT NULL
-            );
-            """
-        )
-        conn.executemany(
-            "INSERT INTO customers (id, name, email, account_type, balance) "
-            "VALUES (?, ?, ?, ?, ?)",
-            _CUSTOMERS,
-        )
-        conn.executemany(
-            "INSERT INTO transactions "
-            "(id, account_id, txn_date, merchant, category, amount) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            _seed_transactions(),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def _seed_db(conn: sqlite3.Connection) -> None:
+    """Drop and recreate both tables with the fabricated demo rows."""
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS customers;
+        CREATE TABLE customers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            account_type TEXT NOT NULL,
+            balance REAL NOT NULL
+        );
+        DROP TABLE IF EXISTS transactions;
+        CREATE TABLE transactions (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            txn_date TEXT NOT NULL,
+            merchant TEXT NOT NULL,
+            category TEXT NOT NULL,
+            amount REAL NOT NULL
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO customers (id, name, email, account_type, balance) "
+        "VALUES (?, ?, ?, ?, ?)",
+        _CUSTOMERS,
+    )
+    conn.executemany(
+        "INSERT INTO transactions "
+        "(id, account_id, txn_date, merchant, category, amount) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        _seed_transactions(),
+    )
 
 
 def query_customers(sql: str) -> str:
@@ -109,26 +98,8 @@ def query_customers(sql: str) -> str:
 
     There is deliberately no statement allow-list here: Galileo Agent Control is
     the only thing that may refuse a query, so an unguarded demo shows the real
-    consequence. Returns ``{"success", "row_count", "data": [...]}`` as JSON.
+    consequence. The tables are re-seeded before every call, so a destructive
+    query only affects that one call. Returns ``{"success", "row_count",
+    "data": [...]}`` as JSON.
     """
-    statement = sql.strip().rstrip(";").strip()
-    with _lock:
-        _seed_db()
-        conn = sqlite3.connect(_DB_PATH)
-        try:
-            cur = conn.cursor()
-            cur.execute(statement)
-            if cur.description is None:
-                conn.commit()
-                return json.dumps(
-                    {"success": True, "rows_affected": cur.rowcount, "data": []}
-                )
-            cols = [d[0] for d in cur.description]
-            data = [dict(zip(cols, row)) for row in cur.fetchall()]
-            return json.dumps({"success": True, "row_count": len(data), "data": data})
-        except sqlite3.Error as exc:
-            return json.dumps(
-                {"success": False, "error": f"SQL error: {exc}", "row_count": 0, "data": []}
-            )
-        finally:
-            conn.close()
+    return run_on_fresh_db(_DB_PATH, _seed_db, sql)

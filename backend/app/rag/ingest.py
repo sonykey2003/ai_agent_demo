@@ -12,15 +12,15 @@ from langchain_postgres import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from ..config import get_settings
-from ..domains import DEFAULT_DOMAIN, get_domains, knowledge_dir
+from ..domains import DEFAULT_DOMAIN, get_domains
 from .vector_store import get_embeddings
 
 SUPPORTED_SUFFIXES = {".md", ".txt", ".csv"}
 
 
 def default_source_dir() -> Path:
-    """Return the bundled knowledge directory in local and container layouts."""
-    return knowledge_dir()
+    """Return the default domain's docs directory in local and container layouts."""
+    return get_domains()[DEFAULT_DOMAIN].docs_dir
 
 
 def _documents_from_file(path: Path, source_dir: Path) -> list[Document]:
@@ -114,7 +114,7 @@ def main() -> None:
         nargs="?",
         type=Path,
         default=default_source_dir(),
-        help="Directory containing Markdown or text files",
+        help="Directory containing Markdown, text, or qa.csv files",
     )
     parser.add_argument(
         "--reset",
